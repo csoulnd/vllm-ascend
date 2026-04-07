@@ -670,8 +670,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
             AscendRMSNormGated310,
         )
         from vllm_ascend._310p.ops.mm_encoder_attention import AscendMMEncoderAttention310
-        from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
-        from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding310
+        from vllm_ascend._310p.ops.rotary_embedding import AscendMRotaryEmbedding310, AscendRotaryEmbedding310
         from vllm_ascend._310p.ops.vocab_parallel_embedding import (
             AscendParallelLMHead310,
             AscendVocabParallelEmbedding310,
