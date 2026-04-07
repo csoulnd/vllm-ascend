@@ -552,6 +552,12 @@ class AscendMRotaryEmbedding(MRotaryEmbedding):
         return query, key
 
 
+class AscendMRotaryEmbedding310(AscendMRotaryEmbedding):
+    """310P-specific M-RoPE; implementation to be filled in."""
+
+    pass
+
+
 class AscendApplyRotaryEmb(ApplyRotaryEmb):
     def __init__(
         self,
