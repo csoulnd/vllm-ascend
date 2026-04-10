@@ -666,7 +666,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
             AscendRMSNormGated310,
         )
         from vllm_ascend._310p.ops.mm_encoder_attention import AscendMMEncoderAttention310
-        from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
+        from vllm_ascend._310p.ops.rotary_embedding import AscendMRotaryEmbedding310, AscendRotaryEmbedding310
         from vllm_ascend._310p.ops.vocab_parallel_embedding import (
             AscendParallelLMHead310,
             AscendVocabParallelEmbedding310,
@@ -684,10 +684,9 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
                 "ParallelLMHead": AscendParallelLMHead310,
                 "VocabParallelEmbedding": AscendVocabParallelEmbedding310,
                 "MMEncoderAttention": AscendMMEncoderAttention310,
+                "MRotaryEmbedding": AscendMRotaryEmbedding310,
             }
         )
-
-        REGISTERED_ASCEND_OPS.pop("MRotaryEmbedding", None)
 
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
