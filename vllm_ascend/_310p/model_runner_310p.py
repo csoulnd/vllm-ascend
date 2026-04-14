@@ -354,6 +354,25 @@ class NPUModelRunner310(NPUModelRunner):
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids."""
 
+        # Track per-request valid query rows for 310P SpecDecoding mask/input compaction.
+        # Placeholder draft token ids are negative (e.g. -1) and should not consume
+        # query rows in splitfuse.
+        num_reqs = self.input_batch.num_reqs
+        valid_query_lens = torch.ones(
+            num_reqs,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if scheduled_spec_tokens:
+            for req_id, cur_index in self.input_batch.req_id_to_index.items():
+                scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 1)
+                draft_tokens = scheduled_spec_tokens.get(req_id, ())
+                invalid_draft_tokens = sum(1 for token in draft_tokens if token < 0)
+                valid_query_lens[cur_index] = max(1, scheduled_tokens - invalid_draft_tokens)
+        self.spec_valid_query_lens_cpu = valid_query_lens
+
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
@@ -433,6 +452,32 @@ class NPUModelRunner310(NPUModelRunner):
             index=draft_tokens_index_tensor,
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
         )
+
+    def _build_attention_metadata(self, *args, **kwargs):
+        attn_metadata, spec_decode_common_attn_metadata = super()._build_attention_metadata(*args, **kwargs)
+
+        if self.attn_state != AscendAttentionState.SpecDecoding:
+            return attn_metadata, spec_decode_common_attn_metadata
+
+        valid_query_lens_cpu = getattr(self, "spec_valid_query_lens_cpu", None)
+        if valid_query_lens_cpu is None:
+            return attn_metadata, spec_decode_common_attn_metadata
+
+        # Attach 310P-only runtime metadata without modifying common metadata schema.
+        seen = set()
+        if isinstance(attn_metadata, dict):
+            values = attn_metadata.values()
+        else:
+            values = (item for ubatch in attn_metadata for item in ubatch.values())
+
+        for meta in values:
+            if id(meta) in seen:
+                continue
+            seen.add(id(meta))
+            num_reqs = int(meta.seq_lens.shape[0])
+            meta.spec_valid_query_lens = valid_query_lens_cpu[:num_reqs].to(meta.seq_lens.device, non_blocking=True)
+
+        return attn_metadata, spec_decode_common_attn_metadata
 
     def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
         """
