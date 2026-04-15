@@ -478,6 +478,10 @@ class NPUModelRunner310(NPUModelRunner):
             if id(meta) in seen:
                 continue
             seen.add(id(meta))
+            # Only AscendMetadata (splitfuse path) carries seq_lens/query_start_loc.
+            # Skip other backend metadata (e.g. GDN) to avoid attribute errors.
+            if not hasattr(meta, "seq_lens"):
+                continue
             num_reqs = int(meta.seq_lens.shape[0])
             meta.spec_valid_query_lens = valid_query_lens_cpu[:num_reqs].to(meta.seq_lens.device, non_blocking=True)
 
