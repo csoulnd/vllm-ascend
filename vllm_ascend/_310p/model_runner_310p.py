@@ -383,7 +383,7 @@ class NPUModelRunner310(NPUModelRunner):
         for req_id, cur_index in self.input_batch.req_id_to_index.items():
             if (prev_index := prev_req_id_to_index.get(req_id)) is not None:
                 prev_common_req_indices.append(prev_index)
-                draft_len = len(scheduled_spec_tokens.get(req_id, ()))
+                draft_len = sum(token >= 0 for token in scheduled_spec_tokens.get(req_id, ()))
                 total_num_spec_tokens += draft_len
                 flattened_index = cu_num_tokens[cur_index].item() - 1
                 sample_flattened_indices.append(flattened_index - draft_len)
