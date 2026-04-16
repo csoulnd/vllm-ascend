@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from contextlib import contextmanager, nullcontext
 
 import numpy as np
@@ -214,6 +215,49 @@ class NPUModelRunner310(NPUModelRunner):
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
+
+    def _patch_local_mtp_scheduler_output(self, scheduler_output: SchedulerOutput) -> SchedulerOutput:
+        if (
+            not self.use_async_scheduling
+            or self.speculative_config is None
+            or self.speculative_config.method != "mtp"
+            or self._draft_token_ids is None
+        ):
+            return scheduler_output
+
+        if not scheduler_output.scheduled_spec_decode_tokens:
+            return scheduler_output
+
+        if isinstance(self._draft_token_ids, torch.Tensor):
+            local_draft_token_ids = self._draft_token_ids.tolist()
+        else:
+            local_draft_token_ids = self._draft_token_ids
+
+        patched_scheduler_output = deepcopy(scheduler_output)
+        patched = False
+        for req_id, req_idx in self.input_batch.req_id_to_index.items():
+            scheduled_spec_token_ids = patched_scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            if scheduled_spec_token_ids is None or req_idx >= len(local_draft_token_ids):
+                continue
+            if all(token < 0 for token in scheduled_spec_token_ids):
+                patched_scheduler_output.scheduled_spec_decode_tokens[req_id] = list(local_draft_token_ids[req_idx])
+                patched = True
+
+        if patched:
+            logger.warning(
+                "[MTP_DEBUG][310p_patch] scheduled_spec_decode_tokens=%s",
+                dict(patched_scheduler_output.scheduled_spec_decode_tokens),
+            )
+            return patched_scheduler_output
+        return scheduler_output
+
+    def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors=None,
+    ):
+        scheduler_output = self._patch_local_mtp_scheduler_output(scheduler_output)
+        return super().execute_model(scheduler_output, intermediate_tensors)
 
     def _check_and_update_cudagraph_mode(
         self,
