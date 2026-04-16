@@ -853,13 +853,23 @@ class NPUModelRunner(GPUModelRunner):
                 draft_token_ids,
             ) in scheduler_output.scheduled_spec_decode_tokens.items():
                 req_idx = self.input_batch.req_id_to_index[req_id]
-                num_draft_tokens[req_idx] = len(draft_token_ids)
+                raw_draft_len = len(draft_token_ids)
+                valid_draft_len = sum(1 for token in draft_token_ids if token >= 0)
+                num_draft_tokens[req_idx] = valid_draft_len
                 if (self.is_kv_consumer and req_id in new_schedule_reqs) or \
                    (self.input_batch.num_computed_tokens_cpu[req_idx] >= \
                     self.input_batch.num_prompt_tokens[req_idx]):
-                    num_decode_draft_tokens[req_idx] = len(draft_token_ids)
+                    num_decode_draft_tokens[req_idx] = valid_draft_len
                 else:
                     num_decode_draft_tokens[req_idx] = -1
+                if self.speculative_config is not None and self.speculative_config.method == "mtp":
+                    logger.warning(
+                        "[MTP_DEBUG][draft_count] req_id=%s raw_draft_token_ids=%s raw_draft_len=%s valid_draft_len=%s",
+                        req_id,
+                        list(draft_token_ids),
+                        raw_draft_len,
+                        valid_draft_len,
+                    )
 
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens,
