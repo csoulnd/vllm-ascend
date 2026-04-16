@@ -640,7 +640,7 @@ class PCPManager:
                 prev_common_req_indices.append(prev_index)
                 # We need to compute the flattened input_ids index of the
                 # last token in each common request.
-                draft_len = sum(token >= 0 for token in scheduled_spec_tokens.get(req_id, ()))
+                draft_len = len(scheduled_spec_tokens.get(req_id, ()))
                 total_num_spec_tokens += draft_len
                 flattened_index = cu_num_tokens[cur_index].item() - 1
                 # example: cu_num_tokens = [2, 5, 8], draft_tokens = [1, 2, 2]
