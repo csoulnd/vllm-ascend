@@ -630,6 +630,20 @@ class NPUModelRunner(GPUModelRunner):
                 dtype=np.int32,
             )
         attn_state = self._build_attn_state(num_reqs, num_scheduled_tokens, num_valid_tokens)
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and scheduler_output.scheduled_spec_decode_tokens
+        ):
+            logger.warning(
+                "[MTP_DEBUG][prepare_inputs] attn_state=%s scheduled_spec_decode_tokens=%s num_scheduled_tokens=%s",
+                attn_state,
+                dict(scheduler_output.scheduled_spec_decode_tokens),
+                {
+                    req_id: scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                    for req_id in self.input_batch.req_ids
+                },
+            )
 
         # Determine if it's a splitfuse batch
         with_prefill = attn_state not in [AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding]
@@ -1658,6 +1672,11 @@ class NPUModelRunner(GPUModelRunner):
             logits,
             sampling_metadata,
         )
+        if self.speculative_config is not None and self.speculative_config.method == "mtp":
+            logger.warning(
+                "[MTP_DEBUG][verify] sampled_token_ids(raw)=%s",
+                sampler_output.sampled_token_ids.tolist(),
+            )
         return sampler_output
 
     # TODO: remove this func after eagle_proposer is refactored and
@@ -1712,6 +1731,11 @@ class NPUModelRunner(GPUModelRunner):
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
                 )
+            if self.speculative_config is not None and self.speculative_config.method == "mtp":
+                logger.warning(
+                    "[MTP_DEBUG][verify] valid_sampled_token_ids=%s",
+                    valid_sampled_token_ids,
+                )
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
@@ -1761,6 +1785,13 @@ class NPUModelRunner(GPUModelRunner):
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
+            if self.speculative_config is not None and self.speculative_config.method == "mtp":
+                logger.warning(
+                    "[MTP_DEBUG][commit] req_id=%s writeback_sampled_ids=%s output_token_ids_tail=%s",
+                    req_id,
+                    sampled_ids,
+                    req_state.output_token_ids[-16:],
+                )
 
         logprobs_lists = (
             logprobs_tensors.tolists(cu_num_tokens)
