@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.worker.cp_utils import (
     get_total_cp_world_size,
 )
@@ -437,6 +438,22 @@ class NPUModelRunner310(NPUModelRunner):
             index=draft_tokens_index_tensor,
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
         )
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if self.speculative_config is None or self.speculative_config.method != "mtp":
+            return super().take_draft_token_ids()
+
+        if self._draft_token_ids is None:
+            return None
+
+        if isinstance(self._draft_token_ids, torch.Tensor):
+            token_ids = self._draft_token_ids.tolist()
+        else:
+            token_ids = self._draft_token_ids
+
+        draft_token_ids = DraftTokenIds(self.input_batch.req_ids.copy(), token_ids)
+        self._draft_token_ids = None
+        return draft_token_ids
 
     def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
         """
