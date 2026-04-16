@@ -1751,7 +1751,23 @@ class NPUModelRunner(GPUModelRunner):
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
 
-            if self.num_spec_tokens <= 0:
+            if self.speculative_config is not None and self.speculative_config.method == "mtp":
+                valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
+                    sampled_token_ids,
+                    self.input_batch.vocab_size,
+                    discard_sampled_tokens_req_indices,
+                    logprobs_tensors=logprobs_tensors,
+                )
+                if self.speculative_config.method == "mtp":
+                    logger.warning(
+                        "[MTP_DEBUG][verify_async] valid_sampled_token_ids=%s",
+                        valid_sampled_token_ids,
+                    )
+                # MTP on 310P can run with placeholder drafts (-1). In this case
+                # the real accepted token is already materialized in sampled_token_ids,
+                # and must be cached for the next step instead of writing [-1].
+                self.input_batch.prev_sampled_token_ids = sampled_token_ids[:, :1].contiguous()
+            elif self.num_spec_tokens <= 0:
                 assert sampled_token_ids.shape[-1] == 1
                 # Cache the sampled tokens on the NPU and avoid CPU sync.
                 # These will be copied into input_ids in the next step
@@ -1770,7 +1786,10 @@ class NPUModelRunner(GPUModelRunner):
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
-                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
+                if self.speculative_config is not None and self.speculative_config.method == "mtp":
+                    sampled_ids = valid_sampled_token_ids[req_idx]
+                else:
+                    sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
             else:
                 sampled_ids = valid_sampled_token_ids[req_idx]
 
