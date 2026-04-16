@@ -17,7 +17,6 @@
 
 from typing import Any
 
-import torch
 import torch_npu
 from vllm.v1.attention.backends.registry import (  # type: ignore
     AttentionBackendEnum,
@@ -217,64 +216,8 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         return output
 
     def forward_spec_decoding_310(self, query, attn_metadata, output):
-        """Execute SpecDecoding on 310P with per-request valid query rows."""
-        num_actual_tokens = int(attn_metadata.num_actual_tokens)
-        query = query[:num_actual_tokens]
-        output = output[:num_actual_tokens]
-
-        qsl_cpu = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
-        scheduled_qlens = qsl_cpu[1:] - qsl_cpu[:-1]
-        spec_valid_query_lens = getattr(attn_metadata, "spec_valid_query_lens", None)
-        if spec_valid_query_lens is None:
-            valid_qlens = scheduled_qlens
-        else:
-            valid_qlens = spec_valid_query_lens.to("cpu", dtype=torch.int32)
-
-        context_lens = attn_metadata.seq_lens
-        block_table = attn_metadata.block_tables
-
-        # Compact valid query rows per request to skip placeholder spec rows.
-        keep_indices = []
-        for req_idx, q_valid in enumerate(valid_qlens.tolist()):
-            q_start = int(qsl_cpu[req_idx].item())
-            keep_indices.extend(range(q_start, q_start + q_valid))
-
-        keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.int64, device=query.device)
-        compact_query = query.index_select(0, keep_indices_tensor)
-        compact_output = torch.empty_like(compact_query)
-
-        # Build a metadata view with effective query_start_loc and valid query lens.
-        compact_qsl = torch.empty(
-            valid_qlens.shape[0] + 1,
-            dtype=torch.int32,
-            device=query.device,
-        )
-        compact_qsl[0] = 0
-        compact_qsl[1:] = torch.cumsum(valid_qlens.to(query.device), dim=0)
-        attn_metadata.query_start_loc = compact_qsl
-        attn_metadata.spec_valid_query_lens = valid_qlens.to(query.device)
-        mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device)
-
-        if context_lens.device != query.device:
-            context_lens = context_lens.to(query.device, non_blocking=True)
-
-        torch_npu._npu_paged_attention_splitfuse(
-            query=compact_query,
-            key_cache=self.key_cache,
-            value_cache=self.value_cache,
-            mask=mask,
-            block_table=block_table,
-            seq_len=valid_qlens,
-            context_lens=context_lens,
-            num_kv_heads=self.num_kv_heads,
-            num_heads=self.num_heads,
-            scale_value=self.scale,
-            out=compact_output,
-        )
-
-        output.zero_()
-        output.index_copy_(0, keep_indices_tensor, compact_output)
-        return output
+        """Execute SpecDecoding on 310P using full query rows plus splitfuse mask."""
+        return self.forward_chunked_prefill_310(query, attn_metadata, output)
 
     def forward_impl(self, query, key, value, kv_cache, attn_metadata, output):
         """

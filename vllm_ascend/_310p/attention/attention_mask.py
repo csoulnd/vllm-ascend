@@ -18,7 +18,7 @@
 import torch
 import torch_npu
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
+from vllm_ascend.attention.attention_v1 import AscendMetadata
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_2d, nd_to_nz_spec
 
 
@@ -80,11 +80,7 @@ class AttentionMaskBuilder310:
             cls.chunked_prefill_attn_mask = cls.gen_causal_additive_mask(cls.max_seqlen, device)
         qsl = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
         qlens = qsl[1:] - qsl[:-1]
-        spec_valid_query_lens = getattr(attn_metadata, "spec_valid_query_lens", None)
-        if attn_metadata.attn_state == AscendAttentionState.SpecDecoding and spec_valid_query_lens is not None:
-            q_list = spec_valid_query_lens.to("cpu", dtype=torch.int32).tolist()
-        else:
-            q_list = qlens.tolist()
+        q_list = qlens.tolist()
         context_lens = attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
         c_list = context_lens.tolist()
         pos_list = [p for ql, cl in zip(q_list, c_list) for p in range(cl - ql, cl)]
