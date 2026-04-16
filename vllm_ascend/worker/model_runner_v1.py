@@ -64,6 +64,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
+    DraftTokenIds,
     ECConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -1568,6 +1569,16 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if self.speculative_config is not None and self.speculative_config.method == "mtp":
+                if isinstance(self._draft_token_ids, torch.Tensor):
+                    draft_debug = self._draft_token_ids.tolist()
+                else:
+                    draft_debug = self._draft_token_ids
+                logger.warning(
+                    "[MTP_DEBUG][draft_propose] req_ids=%s draft_token_ids=%s",
+                    list(scheduler_output.num_scheduled_tokens.keys()),
+                    draft_debug,
+                )
 
         (
             logprobs_lists,
@@ -1661,6 +1672,16 @@ class NPUModelRunner(GPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
         )
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        draft_token_ids = super().take_draft_token_ids()
+        if self.speculative_config is not None and self.speculative_config.method == "mtp":
+            logger.warning(
+                "[MTP_DEBUG][draft_take] req_ids=%s draft_token_ids=%s",
+                getattr(draft_token_ids, "req_ids", None),
+                getattr(draft_token_ids, "token_ids", None),
+            )
+        return draft_token_ids
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
