@@ -1569,16 +1569,6 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
-            if self.speculative_config is not None and self.speculative_config.method == "mtp":
-                if isinstance(self._draft_token_ids, torch.Tensor):
-                    draft_debug = self._draft_token_ids.tolist()
-                else:
-                    draft_debug = self._draft_token_ids
-                logger.warning(
-                    "[MTP_DEBUG][draft_propose] req_ids=%s draft_token_ids=%s",
-                    list(scheduler_output.num_scheduled_tokens.keys()),
-                    draft_debug,
-                )
 
         (
             logprobs_lists,
@@ -1675,12 +1665,6 @@ class NPUModelRunner(GPUModelRunner):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         draft_token_ids = super().take_draft_token_ids()
-        if self.speculative_config is not None and self.speculative_config.method == "mtp":
-            logger.warning(
-                "[MTP_DEBUG][draft_take] req_ids=%s draft_token_ids=%s",
-                getattr(draft_token_ids, "req_ids", None),
-                getattr(draft_token_ids, "token_ids", None),
-            )
         return draft_token_ids
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens

@@ -244,10 +244,6 @@ class NPUModelRunner310(NPUModelRunner):
                 patched = True
 
         if patched:
-            logger.warning(
-                "[MTP_DEBUG][310p_patch] scheduled_spec_decode_tokens=%s",
-                dict(patched_scheduler_output.scheduled_spec_decode_tokens),
-            )
             return patched_scheduler_output
         return scheduler_output
 
