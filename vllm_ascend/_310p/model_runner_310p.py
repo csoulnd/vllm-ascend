@@ -38,6 +38,8 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import DraftTokenIds
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.cp_utils import (
     get_total_cp_world_size,
 )
@@ -494,6 +496,108 @@ class NPUModelRunner310(NPUModelRunner):
         draft_token_ids = DraftTokenIds(self.input_batch.req_ids.copy(), token_ids)
         self._draft_token_ids = None
         return draft_token_ids
+
+    def _bookkeeping_sync(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampler_output: SamplerOutput,
+        logits: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: int,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> tuple[
+        LogprobsLists | None,
+        list[list[int]],
+        dict[str, LogprobsTensors | None],
+        list[str],
+        dict[str, int],
+        list[int],
+    ]:
+        # Keep mtp async bookkeeping behavior scoped to 310P.
+        if not (
+            self.use_async_scheduling
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+        ):
+            return super()._bookkeeping_sync(
+                scheduler_output,
+                sampler_output,
+                logits,
+                hidden_states,
+                num_scheduled_tokens,
+                spec_decode_metadata,
+            )
+
+        discard_sampled_tokens_req_indices = self.discard_request_indices.np[: self.num_discarded_requests]
+        for i in discard_sampled_tokens_req_indices:
+            gen = self.input_batch.generators.get(int(i))
+            if gen is not None:
+                gen.set_offset(gen.get_offset() - 4)
+
+        req_ids_output_copy = self.input_batch.req_ids.copy()
+        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+
+        num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
+        sampled_token_ids = sampler_output.sampled_token_ids
+        logprobs_tensors = sampler_output.logprobs_tensors
+
+        valid_sampled_token_ids: list[list[int]] = []
+        invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+        invalid_req_indices_set = set(invalid_req_indices)
+        cu_num_tokens: list[int] | None = None
+
+        valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
+            sampled_token_ids,
+            self.input_batch.vocab_size,
+            discard_sampled_tokens_req_indices,
+            logprobs_tensors=logprobs_tensors,
+        )
+        # MTP on 310P can run with placeholder drafts (-1). In this case
+        # the real accepted token is already materialized in sampled_token_ids,
+        # and must be cached for the next step.
+        self.input_batch.prev_sampled_token_ids = sampled_token_ids[:, :1].contiguous()
+
+        self.input_batch.prev_req_id_to_index = {
+            req_id: i for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
+        }
+
+        req_ids = self.input_batch.req_ids
+        for req_idx in range(num_sampled_tokens):
+            sampled_ids = valid_sampled_token_ids[req_idx]
+            num_sampled_ids = len(sampled_ids) if sampled_ids else 0
+            if not sampled_ids:
+                continue
+
+            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+            end_idx = start_idx + num_sampled_ids
+            assert end_idx <= self.max_model_len, (
+                "Sampled token IDs exceed the max model length. "
+                f"Total number of tokens: {end_idx} > max_model_len: "
+                f"{self.max_model_len}"
+            )
+
+            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
+            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
+            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            self.input_batch.num_tokens[req_idx] = end_idx
+
+            req_id = req_ids[req_idx]
+            req_state = self.requests[req_id]
+            req_state.output_token_ids.extend(sampled_ids)
+
+        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+            hidden_states[:num_scheduled_tokens],
+            scheduler_output.num_scheduled_tokens,
+        )
+
+        return (
+            None,
+            valid_sampled_token_ids,
+            prompt_logprobs_dict,
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
+            invalid_req_indices,
+        )
 
     def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
         """
