@@ -196,7 +196,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         output = output[:num_actual_tokens]
 
         # Calculate query lengths from start locations
-        qsl_cpu = attn_metadata.query_start_loc.cpu()
+        qsl_cpu = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
         qlens = qsl_cpu[1:] - qsl_cpu[:-1]
 
         context_lens = attn_metadata.seq_lens
