@@ -17,6 +17,7 @@
 
 from typing import Any
 
+import torch
 import torch_npu
 from vllm.v1.attention.backends.registry import (  # type: ignore
     AttentionBackendEnum,
