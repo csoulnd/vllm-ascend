@@ -114,6 +114,15 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
                 device=query.device,
                 non_blocking=True,
             )
+        if attn_metadata.attn_state == AscendAttentionState.SpecDecoding:
+            print(
+                "[MTP2_DTYPE][paged_attention]"
+                f" seq_lens_dtype={attn_metadata.seq_lens.dtype}"
+                f" seq_lens_device={attn_metadata.seq_lens.device}"
+                f" seq_lens_shape={tuple(attn_metadata.seq_lens.shape)}"
+                f" query_dtype={query.dtype}"
+                f" query_shape={tuple(query.shape)}"
+            )
 
         torch_npu._npu_paged_attention(
             query=query,
@@ -192,12 +201,34 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
 
         context_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_tables
+        if attn_metadata.attn_state == AscendAttentionState.SpecDecoding:
+            print(
+                "[MTP2_DTYPE][splitfuse]"
+                f" qsl_dtype={qsl_cpu.dtype}"
+                f" qlens_dtype={qlens.dtype}"
+                f" qlens_shape={tuple(qlens.shape)}"
+                f" context_lens_dtype={context_lens.dtype}"
+                f" context_lens_device={context_lens.device}"
+                f" context_lens_shape={tuple(context_lens.shape)}"
+                f" block_table_dtype={block_table.dtype if block_table is not None else None}"
+                f" block_table_shape={tuple(block_table.shape) if block_table is not None else None}"
+            )
 
         # Generate the specific mask for splitfuse
         mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device)
 
         if context_lens.device != query.device:
             context_lens = context_lens.to(query.device, non_blocking=True)
+        if attn_metadata.attn_state == AscendAttentionState.SpecDecoding:
+            print(
+                "[MTP2_DTYPE][splitfuse_call]"
+                f" seq_len_dtype={qlens.dtype}"
+                f" seq_len_device={qlens.device}"
+                f" seq_len_contiguous={qlens.is_contiguous()}"
+                f" context_lens_dtype={context_lens.dtype}"
+                f" context_lens_device={context_lens.device}"
+                f" context_lens_contiguous={context_lens.is_contiguous()}"
+            )
 
         torch_npu._npu_paged_attention_splitfuse(
             query=query,
