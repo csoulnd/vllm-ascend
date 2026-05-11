@@ -221,6 +221,10 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
 
         return output
 
+    def forward_spec_decoding_310(self, query, attn_metadata, output):
+        """Execute SpecDecoding on 310P using full query rows plus splitfuse mask."""
+        return self.forward_chunked_prefill_310(query, attn_metadata, output)
+
     def forward_impl(self, query, key, value, kv_cache, attn_metadata, output):
         """
         Main dispatch method for attention operations.
@@ -247,6 +251,8 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         # Condition for DecodeOnly: Pure decoding phase where each request generates one token
         elif state == AscendAttentionState.DecodeOnly:
             output = self.forward_paged_attention(query, attn_metadata, output)
+        elif state == AscendAttentionState.SpecDecoding:
+            output = self.forward_spec_decoding_310(query, attn_metadata, output)
         # Condition for ChunkedPrefill:
         # 1. During speculative decoding scenarios (except mtp)
         # 2. Processing large prefill requests in chunks
