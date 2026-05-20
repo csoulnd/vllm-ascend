@@ -25,6 +25,7 @@ import torch
 import torch_npu
 from vllm.config import CUDAGraphMode
 from vllm.logger import logger
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -34,6 +35,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
+)
+from vllm.v1.worker.cp_utils import (
+    get_total_cp_world_size,
 )
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 
@@ -495,6 +499,20 @@ class NPUModelRunner310(NPUModelRunner):
             else:
                 self.kernel_block_sizes.append([0])
 
+        max_num_blocks = []
+        max_model_len = max(self.max_model_len, self.max_encoder_len)
+        for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+            max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
+            if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
+                mamba_blocks_per_req = (
+                    max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
+                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+
+                max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
+            max_num_blocks.append(max_num_blocks_per_req)
+
         if block_sizes != [self.cache_config.block_size] or self.kernel_block_sizes != [[self.cache_config.block_size]]:
             assert self.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
@@ -518,4 +536,5 @@ class NPUModelRunner310(NPUModelRunner):
                     else 0
                 ),
                 kernel_block_sizes=self.kernel_block_sizes,
+                max_num_blocks_per_req=max_num_blocks,
             )
