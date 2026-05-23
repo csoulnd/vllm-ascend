@@ -898,6 +898,15 @@ class RecomputeScheduler(Scheduler):
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                # === MTP debug (temporary; search [MTP] to remove) ===
+                prompt_ids = list(getattr(request, "prompt_token_ids", []) or [])
+                gen_output = list(request.output_token_ids)
+                print(
+                    f"[MTP][sched] req={req_id} generated={generated_token_ids} "
+                    f"accepted={new_token_ids} gen_output={gen_output} "
+                    f"full_seq={prompt_ids + gen_output} "
+                    f"num_computed={request.num_computed_tokens}"
+                )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED

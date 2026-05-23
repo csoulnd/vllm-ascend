@@ -595,6 +595,187 @@ class NPUModelRunner(GPUModelRunner):
 
         return num_reqs_padded
 
+    # === MTP debug helpers (temporary; search [MTP] to remove) ===
+    def _mtp_debug_get_output_seq(self) -> dict[str, list[int]]:
+        if not hasattr(self, "_mtp_debug_seq_store"):
+            self._mtp_debug_seq_store: dict[str, list[int]] = {}
+        return self._mtp_debug_seq_store
+
+    def _mtp_debug_parse_accepted(self, sampled_token_ids: torch.Tensor, req_idx: int) -> list[int]:
+        row = sampled_token_ids[req_idx : req_idx + 1]
+        if row.shape[-1] == 1:
+            token = int(row.item())
+            return [token] if token >= 0 else []
+        valid, _ = RejectionSampler.parse_output(
+            row,
+            self.input_batch.vocab_size,
+            [],
+        )
+        return valid[0]
+
+    def _mtp_debug_log_sequence(
+        self,
+        req_id: str,
+        req_idx: int,
+        step: int,
+        phase: str,
+        round_accepted: list[int] | None = None,
+    ) -> None:
+        output_seq = self._mtp_debug_get_output_seq()
+        if phase == "post" and round_accepted is not None:
+            output_seq.setdefault(req_id, []).extend(round_accepted)
+
+        prompt_len = int(self.input_batch.num_prompt_tokens[req_idx])
+        prompt_tokens = self.input_batch.token_ids_cpu[req_idx, :prompt_len].tolist()
+        gen_output = list(output_seq.get(req_id, []))
+
+        penalty_output: list[int] | None = None
+        sm = self.input_batch.sampling_metadata
+        if sm.output_token_ids and req_idx < len(sm.output_token_ids):
+            raw = sm.output_token_ids[req_idx]
+            if raw:
+                penalty_output = [t for t in raw if t >= 0]
+
+        token_ids_slice: list[int] | None = None
+        if phase == "pre":
+            start = prompt_len
+            end = int(self.input_batch.num_tokens_no_spec[req_idx])
+            if end > start:
+                token_ids_slice = [
+                    int(t)
+                    for t in self.input_batch.token_ids_cpu[req_idx, start:end].tolist()
+                    if int(t) >= 0
+                ]
+
+        print(
+            f"[MTP][seq#{step}] req={req_id} phase={phase} "
+            f"round_accepted={round_accepted} gen_output={gen_output} "
+            f"penalty_output={penalty_output} token_ids_slice={token_ids_slice} "
+            f"full_seq={prompt_tokens + gen_output}"
+        )
+
+    def _mtp_debug_bump_step(self) -> int:
+        step = getattr(self, "_mtp_debug_step", 0) + 1
+        self._mtp_debug_step = step
+        return step
+
+    def _mtp_debug_log_pre_forward(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata,
+        num_draft_tokens: np.ndarray,
+        num_reqs: int,
+    ) -> None:
+        if not self.speculative_config:
+            return
+        step = self._mtp_debug_bump_step()
+        md = spec_decode_metadata
+        inputs_at_li = self.input_ids.gpu[md.logits_indices].detach().cpu().tolist()
+        cu = self.query_start_loc.cpu[: num_reqs + 1]
+        num_computed_gpu = None
+        if getattr(self, "use_async_spec_decode", False):
+            num_computed_gpu = self.num_computed_tokens[:num_reqs].detach().cpu().tolist()
+        valid_count_prev = None
+        valid_sampled_token_count_gpu = getattr(self, "valid_sampled_token_count_gpu", None)
+        if valid_sampled_token_count_gpu is not None:
+            valid_count_prev = valid_sampled_token_count_gpu[:num_reqs].detach().cpu().tolist()
+        prev_sampled = None
+        if self.input_batch.prev_sampled_token_ids is not None:
+            prev_sampled = self.input_batch.prev_sampled_token_ids[:num_reqs, 0].detach().cpu().tolist()
+        num_accepted: list[int | str] = ["NA"] * num_reqs
+        if hasattr(self, "num_accepted_tokens"):
+            num_accepted = self.num_accepted_tokens.np[:num_reqs].tolist()
+        scheduled = scheduler_output.scheduled_spec_decode_tokens
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            if req_idx >= num_reqs:
+                break
+            n_draft = int(num_draft_tokens[req_idx])
+            if n_draft <= 0:
+                continue
+            start, end = int(cu[req_idx]), int(cu[req_idx + 1])
+            batch_input = self.input_ids.gpu[start:end].detach().cpu().tolist()
+            drafts = scheduled.get(req_id, [])
+            ti = int(md.target_logits_indices[req_idx].item())
+            bi = int(md.bonus_logits_indices[req_idx].item())
+            nc_cpu = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+            nc_gpu = num_computed_gpu[req_idx] if num_computed_gpu else "NA"
+            vcp = valid_count_prev[req_idx] if valid_count_prev else "NA"
+            ps = prev_sampled[req_idx] if prev_sampled else "NA"
+            print(
+                f"[MTP][pre#{step}] req={req_id} input={batch_input} drafts={drafts} "
+                f"num_computed_cpu={nc_cpu} num_computed_gpu={nc_gpu} "
+                f"valid_count_prev={vcp} num_accepted={num_accepted[req_idx]} "
+                f"prev_sampled={ps} target_in={inputs_at_li[ti] if ti < len(inputs_at_li) else 'NA'} "
+                f"bonus_in={inputs_at_li[bi] if bi < len(inputs_at_li) else 'NA'}"
+            )
+            self._mtp_debug_log_sequence(req_id, req_idx, step, phase="pre")
+
+    def _mtp_debug_log_post_sample(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        logits: torch.Tensor | None,
+        sampler_output: SamplerOutput,
+    ) -> None:
+        if not self.speculative_config:
+            return
+        step = getattr(self, "_mtp_debug_step", 0)
+        sampled = sampler_output.sampled_token_ids
+        if sampled is None:
+            return
+        real_sampled = sampled.detach().cpu().tolist()
+        if spec_decode_metadata is None or logits is None:
+            for req_idx, req_id in enumerate(self.input_batch.req_ids):
+                if req_idx >= len(real_sampled):
+                    break
+                round_accepted = self._mtp_debug_parse_accepted(sampled, req_idx)
+                print(f"[MTP][post#{step}] req={req_id} real_sampled={real_sampled[req_idx]}")
+                self._mtp_debug_log_sequence(req_id, req_idx, step, phase="post", round_accepted=round_accepted)
+            return
+        md = spec_decode_metadata
+        argmax = logits.argmax(dim=-1)
+        drafts = md.draft_token_ids.detach().cpu().tolist()
+        targets = argmax[md.target_logits_indices].detach().cpu().tolist()
+        bonus = argmax[md.bonus_logits_indices].detach().cpu().tolist()
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            if req_idx >= len(real_sampled):
+                break
+            d = drafts[req_idx] if req_idx < len(drafts) else "NA"
+            t = targets[req_idx] if req_idx < len(targets) else "NA"
+            b = bonus[req_idx] if req_idx < len(bonus) else "NA"
+            print(
+                f"[MTP][post#{step}] req={req_id} real_sampled={real_sampled[req_idx]} "
+                f"verify draft={d} target={t} bonus={b}"
+            )
+            round_accepted = self._mtp_debug_parse_accepted(sampled, req_idx)
+            self._mtp_debug_log_sequence(req_id, req_idx, step, phase="post", round_accepted=round_accepted)
+
+    def _mtp_debug_log_next_drafts(self, draft_token_ids: torch.Tensor | list[list[int]] | None) -> None:
+        if not self.speculative_config or draft_token_ids is None:
+            return
+        step = getattr(self, "_mtp_debug_step", 0)
+        if torch.is_tensor(draft_token_ids):
+            drafts_list = draft_token_ids.detach().cpu().tolist()
+        else:
+            drafts_list = draft_token_ids
+        valid_count = None
+        valid_sampled_token_count_gpu = getattr(self, "valid_sampled_token_count_gpu", None)
+        if valid_sampled_token_count_gpu is not None:
+            n = len(drafts_list)
+            valid_count = valid_sampled_token_count_gpu[:n].detach().cpu().tolist()
+        prev_sampled = None
+        if self.input_batch.prev_sampled_token_ids is not None:
+            n = len(drafts_list)
+            prev_sampled = self.input_batch.prev_sampled_token_ids[:n, 0].detach().cpu().tolist()
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            if req_idx >= len(drafts_list):
+                break
+            vc = valid_count[req_idx] if valid_count else "NA"
+            ps = prev_sampled[req_idx] if prev_sampled else "NA"
+            print(
+                f"[MTP][next#{step}] req={req_id} next_drafts={drafts_list[req_idx]} "
+                f"prev_sampled={ps} valid_count={vc}"
+            )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -856,6 +1037,10 @@ class NPUModelRunner(GPUModelRunner):
             )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
+
+            self._mtp_debug_log_pre_forward(
+                scheduler_output, spec_decode_metadata, num_draft_tokens, num_reqs
+            )
 
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
@@ -1523,6 +1708,8 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        self._mtp_debug_log_post_sample(spec_decode_metadata, logits, sampler_output)
+
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
                 self.sampling_done_event = torch.npu.Event()
@@ -1546,6 +1733,7 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
+            self._mtp_debug_log_next_drafts(self._draft_token_ids)
 
         (
             logprobs_lists,
