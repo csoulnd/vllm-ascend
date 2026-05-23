@@ -578,7 +578,7 @@ class NPUModelRunner(GPUModelRunner):
         valid, _ = RejectionSampler.parse_output(
             row,
             self.input_batch.vocab_size,
-            discard_sampled_tokens_req_indices=[],
+            [],
         )
         return valid[0]
 
