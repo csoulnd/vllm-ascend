@@ -1057,6 +1057,10 @@ class NPUModelRunner(GPUModelRunner):
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
 
+            # === MTP debug ===
+            for req_id, drafts in scheduler_output.scheduled_spec_decode_tokens.items():
+                print(f"[MTP] scheduled_drafts req={req_id} drafts={drafts}")
+
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
@@ -1538,6 +1542,12 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
+
+            # === MTP debug ===
+            if torch.is_tensor(draft_token_ids):
+                print(f"[MTP] next_drafts={draft_token_ids.detach().cpu().tolist()}")
+            else:
+                print(f"[MTP] next_drafts={draft_token_ids}")
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
@@ -2020,6 +2030,15 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        # === MTP debug ===
+        if spec_decode_metadata is not None and logits is not None:
+            md = spec_decode_metadata
+            argmax = logits.argmax(dim=-1)
+            drafts = md.draft_token_ids.detach().cpu().tolist()
+            targets = argmax[md.target_logits_indices].detach().cpu().tolist()
+            bonus = argmax[md.bonus_logits_indices].detach().cpu().tolist()
+            print(f"[MTP] verify drafts={drafts} target={targets} bonus={bonus}")
+
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
                 self.sampling_done_event = torch.npu.Event()
@@ -2230,6 +2249,18 @@ class NPUModelRunner(GPUModelRunner):
             if max_gen_len == 1:
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
+
+                # === MTP debug ===
+                for req_idx, req_id in enumerate(self.input_batch.req_ids):
+                    if req_idx >= len(valid_sampled_token_ids):
+                        break
+                    out_before = self.requests[req_id].output_token_ids
+                    phase = "prefill_first" if len(out_before) == 0 else "decode"
+                    print(
+                        f"[MTP] {phase} req={req_id} token={valid_sampled_token_ids[req_idx]} "
+                        f"output_before={out_before}"
+                    )
+
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[int(i)].clear()
@@ -2244,6 +2275,16 @@ class NPUModelRunner(GPUModelRunner):
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
                 )
+
+                # === MTP debug ===
+                for req_idx, req_id in enumerate(self.input_batch.req_ids):
+                    if req_idx >= sampled_token_ids.shape[0]:
+                        break
+                    print(
+                        f"[MTP] accepted req={req_id} "
+                        f"raw={sampled_token_ids[req_idx].tolist()} "
+                        f"valid={valid_sampled_token_ids[req_idx]}"
+                    )
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
@@ -2293,6 +2334,9 @@ class NPUModelRunner(GPUModelRunner):
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
+
+            # === MTP debug ===
+            print(f"[MTP] full_output req={req_id} output={req_state.output_token_ids}")
 
         # logprobs_lists is already set above:
         # - max_gen_len == 1: logprobs_tensors.tolists() (no cu_num_tokens)
