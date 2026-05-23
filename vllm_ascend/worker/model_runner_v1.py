@@ -565,6 +565,64 @@ class NPUModelRunner(GPUModelRunner):
         return num_reqs_padded
 
     # === MTP debug helpers (temporary; search [MTP] to remove) ===
+    def _mtp_debug_output_seq(self) -> dict[str, list[int]]:
+        if not hasattr(self, "_mtp_debug_output_seq"):
+            self._mtp_debug_output_seq: dict[str, list[int]] = {}
+        return self._mtp_debug_output_seq
+
+    def _mtp_debug_parse_accepted(self, sampled_token_ids: torch.Tensor, req_idx: int) -> list[int]:
+        row = sampled_token_ids[req_idx : req_idx + 1]
+        if row.shape[-1] == 1:
+            token = int(row.item())
+            return [token] if token >= 0 else []
+        valid, _ = RejectionSampler.parse_output(
+            row,
+            self.input_batch.vocab_size,
+            discard_sampled_tokens_req_indices=[],
+        )
+        return valid[0]
+
+    def _mtp_debug_log_sequence(
+        self,
+        req_id: str,
+        req_idx: int,
+        step: int,
+        phase: str,
+        round_accepted: list[int] | None = None,
+    ) -> None:
+        output_seq = self._mtp_debug_output_seq()
+        if phase == "post" and round_accepted is not None:
+            output_seq.setdefault(req_id, []).extend(round_accepted)
+
+        prompt_len = int(self.input_batch.num_prompt_tokens[req_idx])
+        prompt_tokens = self.input_batch.token_ids_cpu[req_idx, :prompt_len].tolist()
+        gen_output = list(output_seq.get(req_id, []))
+
+        penalty_output: list[int] | None = None
+        sm = self.input_batch.sampling_metadata
+        if sm.output_token_ids and req_idx < len(sm.output_token_ids):
+            raw = sm.output_token_ids[req_idx]
+            if raw:
+                penalty_output = [t for t in raw if t >= 0]
+
+        token_ids_slice: list[int] | None = None
+        if phase == "pre":
+            start = prompt_len
+            end = int(self.input_batch.num_tokens_no_spec[req_idx])
+            if end > start:
+                token_ids_slice = [
+                    int(t)
+                    for t in self.input_batch.token_ids_cpu[req_idx, start:end].tolist()
+                    if int(t) >= 0
+                ]
+
+        print(
+            f"[MTP][seq#{step}] req={req_id} phase={phase} "
+            f"round_accepted={round_accepted} gen_output={gen_output} "
+            f"penalty_output={penalty_output} token_ids_slice={token_ids_slice} "
+            f"full_seq={prompt_tokens + gen_output}"
+        )
+
     def _mtp_debug_bump_step(self) -> int:
         step = getattr(self, "_mtp_debug_step", 0) + 1
         self._mtp_debug_step = step
@@ -617,6 +675,7 @@ class NPUModelRunner(GPUModelRunner):
                 f"prev_sampled={ps} target_in={inputs_at_li[ti] if ti < len(inputs_at_li) else 'NA'} "
                 f"bonus_in={inputs_at_li[bi] if bi < len(inputs_at_li) else 'NA'}"
             )
+            self._mtp_debug_log_sequence(req_id, req_idx, step, phase="pre")
 
     def _mtp_debug_log_post_sample(
         self,
@@ -635,7 +694,9 @@ class NPUModelRunner(GPUModelRunner):
             for req_idx, req_id in enumerate(self.input_batch.req_ids):
                 if req_idx >= len(real_sampled):
                     break
+                round_accepted = self._mtp_debug_parse_accepted(sampled, req_idx)
                 print(f"[MTP][post#{step}] req={req_id} real_sampled={real_sampled[req_idx]}")
+                self._mtp_debug_log_sequence(req_id, req_idx, step, phase="post", round_accepted=round_accepted)
             return
         md = spec_decode_metadata
         argmax = logits.argmax(dim=-1)
@@ -652,6 +713,8 @@ class NPUModelRunner(GPUModelRunner):
                 f"[MTP][post#{step}] req={req_id} real_sampled={real_sampled[req_idx]} "
                 f"verify draft={d} target={t} bonus={b}"
             )
+            round_accepted = self._mtp_debug_parse_accepted(sampled, req_idx)
+            self._mtp_debug_log_sequence(req_id, req_idx, step, phase="post", round_accepted=round_accepted)
 
     def _mtp_debug_log_next_drafts(self, draft_token_ids: torch.Tensor | list[list[int]] | None) -> None:
         if not self.speculative_config or draft_token_ids is None:
