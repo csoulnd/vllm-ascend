@@ -565,10 +565,10 @@ class NPUModelRunner(GPUModelRunner):
         return num_reqs_padded
 
     # === MTP debug helpers (temporary; search [MTP] to remove) ===
-    def _mtp_debug_output_seq(self) -> dict[str, list[int]]:
-        if not hasattr(self, "_mtp_debug_output_seq"):
-            self._mtp_debug_output_seq: dict[str, list[int]] = {}
-        return self._mtp_debug_output_seq
+    def _mtp_debug_get_output_seq(self) -> dict[str, list[int]]:
+        if not hasattr(self, "_mtp_debug_seq_store"):
+            self._mtp_debug_seq_store: dict[str, list[int]] = {}
+        return self._mtp_debug_seq_store
 
     def _mtp_debug_parse_accepted(self, sampled_token_ids: torch.Tensor, req_idx: int) -> list[int]:
         row = sampled_token_ids[req_idx : req_idx + 1]
@@ -590,7 +590,7 @@ class NPUModelRunner(GPUModelRunner):
         phase: str,
         round_accepted: list[int] | None = None,
     ) -> None:
-        output_seq = self._mtp_debug_output_seq()
+        output_seq = self._mtp_debug_get_output_seq()
         if phase == "post" and round_accepted is not None:
             output_seq.setdefault(req_id, []).extend(round_accepted)
 
