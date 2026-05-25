@@ -1,34 +1,24 @@
 #!/usr/bin/env python3
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
-"""Compare MTP forward dumps from two runs (e.g. 910 golden vs 310p).
-
-Each dump file is produced by vllm-ascend when VLLM_ASCEND_MTP_DUMP=1:
-  forward_step{step:04d}_{910|310p}.pt
+"""Compare two MTP forward dump .pt files (e.g. 910 golden vs 310p).
 
 Example:
   python tools/compare_mtp_dump.py \\
-    --ref-dir /tmp/mtp_dump/golden \\
-    --cmp-dir /tmp/mtp_dump/310p \\
-    --ref-tag 910 --cmp-tag 310p
+    /tmp/mtp_dump/golden/forward_step0002_910.pt \\
+    /tmp/mtp_dump/310p/forward_step0002_310p.pt
 
-  python tools/compare_mtp_dump.py \\
-    --ref-dir /path/to/910_dumps \\
-    --cmp-dir /path/to/310p_dumps \\
-    --steps 1,2,3
+  python tools/compare_mtp_dump.py ref.pt cmp.pt --print-contents
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import torch
-
-DUMP_NAME_RE = re.compile(r"^forward_step(\d+)_(\w+)\.pt$")
 
 INPUT_TENSOR_KEYS = (
     "input_ids",
@@ -53,81 +43,45 @@ SPEC_TENSOR_KEYS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare MTP target-model forward dumps between two directories.",
+        description="Compare two MTP forward dump .pt files.",
     )
-    parser.add_argument(
-        "--ref-dir",
-        type=Path,
-        required=True,
-        help="Reference (golden) dump directory, e.g. 910 run.",
-    )
-    parser.add_argument(
-        "--cmp-dir",
-        type=Path,
-        required=True,
-        help="Compare (suspect) dump directory, e.g. 310p run.",
-    )
-    parser.add_argument(
-        "--ref-tag",
-        type=str,
-        default="910",
-        help="Filename tag for reference dumps (default: 910).",
-    )
-    parser.add_argument(
-        "--cmp-tag",
-        type=str,
-        default="310p",
-        help="Filename tag for compare dumps (default: 310p).",
-    )
-    parser.add_argument(
-        "--steps",
-        type=str,
-        default="all",
-        help='Steps to compare: "all" or comma-separated ids, e.g. "1,2,3".',
-    )
+    parser.add_argument("ref_pt", type=Path, help="Reference (golden) .pt file.")
+    parser.add_argument("cmp_pt", type=Path, help="Compare (suspect) .pt file.")
     parser.add_argument(
         "--rtol",
         type=float,
         default=0.0,
-        help="Relative tolerance for float tensor compare (default: 0, exact).",
+        help="Relative tolerance for float tensors (default: 0).",
     )
     parser.add_argument(
         "--atol",
         type=float,
         default=0.0,
-        help="Absolute tolerance for float tensor compare (default: 0, exact).",
+        help="Absolute tolerance for float tensors (default: 0).",
     )
     parser.add_argument(
         "--show-topk",
         type=int,
         default=5,
-        help="When tensors differ, print top-k largest abs diffs (default: 5).",
+        help="When tensors differ, show top-k abs diffs (default: 5).",
+    )
+    parser.add_argument(
+        "--print-contents",
+        action="store_true",
+        help="Print both .pt records before comparing.",
+    )
+    parser.add_argument(
+        "--full-hidden",
+        action="store_true",
+        help="With --print-contents, print full hidden_states tensor.",
+    )
+    parser.add_argument(
+        "--max-tensor-elems",
+        type=int,
+        default=128,
+        help="Max elements printed per large tensor (default: 128).",
     )
     return parser.parse_args()
-
-
-def parse_steps_arg(steps_arg: str) -> set[int] | None:
-    if not steps_arg or steps_arg.lower() == "all":
-        return None
-    return {int(part.strip()) for part in steps_arg.split(",") if part.strip()}
-
-
-def find_dump_path(directory: Path, step: int, tag: str) -> Path:
-    path = directory / f"forward_step{step:04d}_{tag}.pt"
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing dump file: {path}")
-    return path
-
-
-def discover_steps(directory: Path, tag: str) -> list[int]:
-    steps: list[int] = []
-    for path in directory.iterdir():
-        if not path.is_file():
-            continue
-        match = DUMP_NAME_RE.match(path.name)
-        if match and match.group(2) == tag:
-            steps.append(int(match.group(1)))
-    return sorted(steps)
 
 
 def load_record(path: Path) -> dict[str, Any]:
@@ -135,6 +89,70 @@ def load_record(path: Path) -> dict[str, Any]:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         return torch.load(path, map_location="cpu")
+
+
+def format_tensor(
+    tensor: torch.Tensor | None,
+    *,
+    max_elems: int,
+    full: bool = False,
+) -> str:
+    if tensor is None:
+        return "None"
+    t = tensor.detach().cpu()
+    header = f"dtype={t.dtype} shape={tuple(t.shape)} numel={t.numel()}"
+    if t.numel() == 0:
+        return f"{header} value=[]"
+    if full or t.numel() <= max_elems:
+        return f"{header}\n  value={t.flatten().tolist()}"
+    flat = t.flatten()
+    shown = flat[:max_elems].tolist()
+    suffix = f" ... (+{t.numel() - max_elems} more)" if t.numel() > max_elems else ""
+    return f"{header}\n  value(head)={shown}{suffix}"
+
+
+def format_record(
+    record: dict[str, Any],
+    *,
+    max_elems: int,
+    full_hidden: bool,
+) -> str:
+    lines: list[str] = []
+    lines.append(f"  step={record.get('step')} path={record.get('path')} model={record.get('model')}")
+    lines.append(f"  req_ids={record.get('req_ids')}")
+    lines.append(
+        f"  num_tokens_unpadded={record.get('num_tokens_unpadded')} "
+        f"num_tokens_padded={record.get('num_tokens_padded')}"
+    )
+
+    inputs = record.get("inputs") or {}
+    lines.append("  [inputs]")
+    lines.append(f"    per_req_input_ids={inputs.get('per_req_input_ids')}")
+    for key in INPUT_TENSOR_KEYS:
+        lines.append(f"    {key}:")
+        lines.append(f"      {format_tensor(inputs.get(key), max_elems=max_elems)}")
+
+    spec = inputs.get("spec_decode")
+    if spec is not None:
+        lines.append("    [spec_decode]")
+        for key in SPEC_TENSOR_KEYS:
+            lines.append(f"      {key}:")
+            lines.append(f"        {format_tensor(spec.get(key), max_elems=max_elems)}")
+
+    outputs = record.get("outputs") or {}
+    lines.append("  [outputs]")
+    for key in OUTPUT_TENSOR_KEYS:
+        lines.append(f"    {key}:")
+        full = full_hidden and key == "hidden_states"
+        lines.append(f"      {format_tensor(outputs.get(key), max_elems=max_elems, full=full)}")
+
+    return "\n".join(lines)
+
+
+def print_record(label: str, path: Path, record: dict[str, Any], *, max_elems: int, full_hidden: bool) -> None:
+    print(f"[{label}] {path}")
+    print(format_record(record, max_elems=max_elems, full_hidden=full_hidden))
+    print()
 
 
 def compare_scalar(name: str, ref: Any, cmp: Any, mismatches: list[str]) -> None:
@@ -150,9 +168,7 @@ def compare_list(name: str, ref: list, cmp: list, mismatches: list[str]) -> None
 
 
 def tensor_stats(ref: torch.Tensor, cmp: torch.Tensor) -> dict[str, Any]:
-    ref_f = ref.float()
-    cmp_f = cmp.float()
-    diff = (ref_f - cmp_f).abs()
+    diff = (ref.float() - cmp.float()).abs()
     return {
         "max_abs_diff": float(diff.max().item()) if diff.numel() else 0.0,
         "mean_abs_diff": float(diff.mean().item()) if diff.numel() else 0.0,
@@ -176,8 +192,7 @@ def compare_tensor(
         mismatches.append(f"{name}: ref_is_none={ref is None} cmp_is_none={cmp is None}")
         return
     if ref.shape != cmp.shape:
-        stats = tensor_stats(ref, cmp)
-        mismatches.append(f"{name}: shape mismatch {stats}")
+        mismatches.append(f"{name}: shape mismatch {tensor_stats(ref, cmp)}")
         return
     if ref.dtype != cmp.dtype:
         ref = ref.to(cmp.dtype)
@@ -194,9 +209,9 @@ def compare_tensor(
         diff = (ref.float() - cmp.float()).abs().flatten()
         k = min(show_topk, diff.numel())
         topv, topi = torch.topk(diff, k)
-        detail += f" top{k}_diff_idx={topi.tolist()} top{k}_diff_val={topv.tolist()}"
+        detail += f" top{k}_idx={topi.tolist()} top{k}_val={topv.tolist()}"
         if ref.dim() == 1:
-            detail += f" ref_at_idx={ref.flatten()[topi].tolist()} cmp_at_idx={cmp.flatten()[topi].tolist()}"
+            detail += f" ref={ref.flatten()[topi].tolist()} cmp={cmp.flatten()[topi].tolist()}"
     mismatches.append(detail)
 
 
@@ -296,80 +311,44 @@ def classify_divergence(mismatches: list[str]) -> str:
 
 def main() -> int:
     args = parse_args()
-    ref_dir = args.ref_dir.expanduser().resolve()
-    cmp_dir = args.cmp_dir.expanduser().resolve()
-    if not ref_dir.is_dir():
-        print(f"ERROR: ref-dir not found: {ref_dir}", file=sys.stderr)
-        return 2
-    if not cmp_dir.is_dir():
-        print(f"ERROR: cmp-dir not found: {cmp_dir}", file=sys.stderr)
-        return 2
+    ref_path = args.ref_pt.expanduser().resolve()
+    cmp_path = args.cmp_pt.expanduser().resolve()
 
-    step_filter = parse_steps_arg(args.steps)
-    ref_steps = discover_steps(ref_dir, args.ref_tag)
-    cmp_steps = discover_steps(cmp_dir, args.cmp_tag)
-    common_steps = sorted(set(ref_steps) & set(cmp_steps))
-    if step_filter is not None:
-        common_steps = [s for s in common_steps if s in step_filter]
-
-    if not common_steps:
-        print(
-            f"ERROR: no common steps. ref={ref_steps} ({args.ref_tag}), "
-            f"cmp={cmp_steps} ({args.cmp_tag})",
-            file=sys.stderr,
-        )
+    if not ref_path.is_file():
+        print(f"ERROR: ref file not found: {ref_path}", file=sys.stderr)
+        return 2
+    if not cmp_path.is_file():
+        print(f"ERROR: cmp file not found: {cmp_path}", file=sys.stderr)
         return 2
 
-    only_ref = sorted(set(ref_steps) - set(cmp_steps))
-    only_cmp = sorted(set(cmp_steps) - set(ref_steps))
-    if only_ref:
-        print(f"WARN: steps only in ref-dir: {only_ref}")
-    if only_cmp:
-        print(f"WARN: steps only in cmp-dir: {only_cmp}")
+    ref_rec = load_record(ref_path)
+    cmp_rec = load_record(cmp_path)
 
-    print(f"Comparing {len(common_steps)} step(s): {common_steps}")
-    print(f"  ref: {ref_dir} (tag={args.ref_tag})")
-    print(f"  cmp: {cmp_dir} (tag={args.cmp_tag})")
-    print(f"  tol: rtol={args.rtol} atol={args.atol}")
+    print(f"REF: {ref_path}")
+    print(f"CMP: {cmp_path}")
+    print(f"tol: rtol={args.rtol} atol={args.atol}")
     print()
 
-    all_ok = True
-    first_fail: tuple[int, str] | None = None
+    if args.print_contents:
+        print_record("REF", ref_path, ref_rec, max_elems=args.max_tensor_elems, full_hidden=args.full_hidden)
+        print_record("CMP", cmp_path, cmp_rec, max_elems=args.max_tensor_elems, full_hidden=args.full_hidden)
 
-    for step in common_steps:
-        ref_path = find_dump_path(ref_dir, step, args.ref_tag)
-        cmp_path = find_dump_path(cmp_dir, step, args.cmp_tag)
-        ref_rec = load_record(ref_path)
-        cmp_rec = load_record(cmp_path)
-        mismatches = compare_record(ref_rec, cmp_rec, args.rtol, args.atol, args.show_topk)
+    mismatches = compare_record(ref_rec, cmp_rec, args.rtol, args.atol, args.show_topk)
 
-        if not mismatches:
-            print(f"[step {step:04d}] OK — inputs and outputs match")
-            continue
-
-        all_ok = False
-        kind = classify_divergence(mismatches)
-        if first_fail is None:
-            first_fail = (step, kind)
-        print(f"[step {step:04d}] MISMATCH ({kind}) — {len(mismatches)} issue(s)")
-        for line in mismatches:
-            print(f"  - {line}")
-        print()
-
-    print("=" * 60)
-    if all_ok:
-        print("RESULT: ALL STEPS MATCH")
+    if not mismatches:
+        print("RESULT: MATCH")
         return 0
 
-    assert first_fail is not None
-    step, kind = first_fail
-    print(f"RESULT: DIVERGED at step {step} ({kind})")
+    kind = classify_divergence(mismatches)
+    print(f"RESULT: MISMATCH ({kind}) — {len(mismatches)} issue(s)")
+    for line in mismatches:
+        print(f"  - {line}")
     if kind == "inputs_only":
-        print("  -> Check scheduler/token scatter before forward (not GDN yet).")
+        print("  -> Inputs differ; check scheduler/token layout before forward.")
     elif kind == "outputs_only":
-        print("  -> Inputs match; suspect model ops (e.g. GDN/linear_attn) or KV state.")
+        print("  -> Inputs match; suspect model ops (e.g. GDN) or KV state.")
     elif kind == "inputs_and_outputs":
-        print("  -> Both inputs and outputs differ; fix inputs first.")
+        print("  -> Both differ; fix inputs first.")
     return 1
 
 
