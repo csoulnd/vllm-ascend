@@ -380,19 +380,29 @@ def print_section(title: str, section: SectionReport) -> None:
     print()
 
 
-def print_final(report: CompareReport) -> None:
+def print_final(report: CompareReport, *, is_gdn_op: bool = False) -> None:
     if report.ok:
-        print("RESULT: PASS — pre-forward inputs match; outputs meet cosine threshold.")
+        if is_gdn_op:
+            print("RESULT: PASS — operator inputs match; outputs meet cosine threshold.")
+        else:
+            print("RESULT: PASS — pre-forward inputs match; outputs meet cosine threshold.")
         return
     if not report.inputs.ok:
-        print("RESULT: FAIL — pre-forward inputs differ (see [FAIL] lines above).")
+        if is_gdn_op:
+            print("RESULT: FAIL — operator inputs differ (see [FAIL] lines above).")
+        else:
+            print("RESULT: FAIL — pre-forward inputs differ (see [FAIL] lines above).")
         if report.outputs.ok:
             print("         outputs OK; fix inputs before trusting output diff.")
         else:
             print("         outputs also differ; fix inputs first.")
         return
-    print("RESULT: FAIL — pre-forward inputs match, but hidden states diverge.")
-    print("         suspect forward ops / KV / GDN (not scheduler input layout).")
+    if is_gdn_op:
+        print("RESULT: FAIL — operator inputs match, but outputs diverge.")
+        print("         pinpoint which GDN op (causal_conv_spec vs recurrent_spec) from filename.")
+    else:
+        print("RESULT: FAIL — pre-forward inputs match, but hidden states diverge.")
+        print("         suspect forward ops / KV / GDN (not scheduler input layout).")
 
 
 def compare_record(
@@ -426,8 +436,12 @@ def main() -> int:
 
     print(f"REF: {ref_path}")
     print(f"CMP: {cmp_path}")
-    if ref_rec.get("op"):
-        print(f"GDN op={ref_rec.get('op')} layer={ref_rec.get('layer_prefix')}")
+    op = ref_rec.get("op") or cmp_rec.get("op")
+    if op:
+        print(
+            f"GDN operator dump: op={op} "
+            f"layer={ref_rec.get('layer_prefix') or cmp_rec.get('layer_prefix')}"
+        )
     print(f"cosine_min={args.cosine_min}")
     print()
 
@@ -450,6 +464,7 @@ def main() -> int:
             print()
 
     report = compare_record(ref_rec, cmp_rec, cosine_min=args.cosine_min, embeds_atol=args.embeds_atol)
+    is_gdn_op = bool(ref_rec.get("op") or cmp_rec.get("op"))
 
     if report.info_notes:
         print("=== Context (not scored: step / path / req_ids / num_tokens) ===")
@@ -457,9 +472,19 @@ def main() -> int:
             print(f"  {line}")
         print()
 
-    print_section("=== [1/2] Pre-forward INPUT (strict, value-equal) ===", report.inputs)
-    print_section("=== [2/2] Forward OUTPUT (global cosine) ===", report.outputs)
-    print_final(report)
+    input_title = (
+        "=== [1/2] Operator INPUT (strict, value-equal) ==="
+        if is_gdn_op
+        else "=== [1/2] Pre-forward INPUT (strict, value-equal) ==="
+    )
+    output_title = (
+        "=== [2/2] Operator OUTPUT (global cosine) ==="
+        if is_gdn_op
+        else "=== [2/2] Forward OUTPUT (global cosine) ==="
+    )
+    print_section(input_title, report.inputs)
+    print_section(output_title, report.outputs)
+    print_final(report, is_gdn_op=is_gdn_op)
     return 0 if report.ok else 1
 
 

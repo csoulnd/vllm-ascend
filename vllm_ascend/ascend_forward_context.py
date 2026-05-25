@@ -148,6 +148,10 @@ def set_ascend_forward_context(
         forward_context.model_instance = model_instance
         forward_context.is_draft_model = is_draft_model
         forward_context.is_draft_model_prefill = False
+        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+            forward_context.additional_kwargs["mtp_forward_step"] = 0
+        else:
+            forward_context.mtp_forward_step = 0
 
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
@@ -356,7 +360,7 @@ class _ExtraForwardContextProxy:
         self.check_extra_attr(name)
         ctx = self._ctx()
         if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
-            return ctx.additional_kwargs[name]
+            return ctx.additional_kwargs.get(name)
         return getattr(ctx, name)
 
     def __setattr__(self, name: str, value: Any) -> None:

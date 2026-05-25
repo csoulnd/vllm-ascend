@@ -28,7 +28,12 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
-from vllm_ascend.debug.gdn_op_dump import mark_gdn_dump_done, save_gdn_op_dump, should_dump_gdn_spec_ops
+from vllm_ascend.debug.gdn_op_dump import (
+    current_forward_step,
+    mark_gdn_dump_done,
+    save_gdn_op_dump,
+    should_dump_gdn_spec_ops,
+)
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
@@ -210,7 +215,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = mixed_qkv
 
         dump_gdn_ops = should_dump_gdn_spec_ops(self.prefix, attn_metadata)
-        dump_pure_spec = dump_gdn_ops and attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0
+        dump_pure_spec = dump_gdn_ops
+        dump_forward_step = current_forward_step() if dump_pure_spec else 0
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
@@ -239,8 +245,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         "num_accepted_tokens": num_accepted_tokens,
                     },
                     outputs={"mixed_qkv": mixed_qkv_spec},
+                    forward_step=dump_forward_step,
                 )
                 logger.info("GDN op dump saved: %s", dump_path)
+                mark_gdn_dump_done()
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -337,9 +345,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         "num_accepted_tokens": num_accepted_tokens,
                     },
                     outputs={"core_attn_out": core_attn_out_spec},
+                    forward_step=dump_forward_step,
                 )
                 logger.info("GDN op dump saved: %s", dump_path)
-                mark_gdn_dump_done()
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 

@@ -29,7 +29,12 @@ from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_r
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.fused_recurrent_gated_delta_rule import fused_recurrent_gated_delta_rule_pytorch
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
-from vllm_ascend.debug.gdn_op_dump import mark_gdn_dump_done, save_gdn_op_dump, should_dump_gdn_spec_ops
+from vllm_ascend.debug.gdn_op_dump import (
+    current_forward_step,
+    mark_gdn_dump_done,
+    save_gdn_op_dump,
+    should_dump_gdn_spec_ops,
+)
 from vllm_ascend.utils import enable_sp
 
 
@@ -99,7 +104,8 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
             mixed_qkv_non_spec = mixed_qkv
         activation_num = 1 if self.activation else 0
         dump_gdn_ops = should_dump_gdn_spec_ops(self.prefix, attn_metadata)
-        dump_pure_spec = dump_gdn_ops and attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0
+        dump_pure_spec = dump_gdn_ops
+        dump_forward_step = current_forward_step() if dump_pure_spec else 0
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
@@ -132,8 +138,10 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                         "num_accepted_tokens": to_int64_tuple(num_accepted_tokens),
                     },
                     outputs={"mixed_qkv": mixed_qkv_spec},
+                    forward_step=dump_forward_step,
                 )
                 logger.info("GDN op dump saved: %s", dump_path)
+                mark_gdn_dump_done()
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -222,9 +230,9 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                             "num_accepted_tokens": num_accepted_tokens,
                         },
                         outputs={"core_attn_out": core_attn_out_spec},
+                        forward_step=dump_forward_step,
                     )
                     logger.info("GDN op dump saved: %s", dump_path)
-                    mark_gdn_dump_done()
             else:
                 core_attn_out_spec, last_recurrent_state = None, None
 
