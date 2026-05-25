@@ -112,6 +112,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Enable temporary MTP speculative-decoding debug prints ([MTP][pre/post/seq/next/sched]).
+    # Default is disabled. Set to 1 when debugging MTP accuracy issues.
+    "VLLM_ASCEND_MTP_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_MTP_DEBUG", "0"))),
 }
 
 # end-env-vars-definition

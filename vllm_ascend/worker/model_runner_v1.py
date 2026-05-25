@@ -76,6 +76,7 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.utils import vllm_version_is
 
 if not vllm_version_is("0.20.2"):
@@ -628,6 +629,10 @@ class NPUModelRunner(GPUModelRunner):
         return num_reqs_padded
 
     # === MTP debug helpers (temporary; search [MTP] to remove) ===
+    @staticmethod
+    def _mtp_debug_enabled() -> bool:
+        return envs.VLLM_ASCEND_MTP_DEBUG
+
     def _mtp_debug_get_output_seq(self) -> dict[str, list[int]]:
         if not hasattr(self, "_mtp_debug_seq_store"):
             self._mtp_debug_seq_store: dict[str, list[int]] = {}
@@ -698,7 +703,7 @@ class NPUModelRunner(GPUModelRunner):
         num_draft_tokens: np.ndarray,
         num_reqs: int,
     ) -> None:
-        if not self.speculative_config:
+        if not self.speculative_config or not self._mtp_debug_enabled():
             return
         step = self._mtp_debug_bump_step()
         md = spec_decode_metadata
@@ -746,7 +751,7 @@ class NPUModelRunner(GPUModelRunner):
         logits: torch.Tensor | None,
         sampler_output: SamplerOutput,
     ) -> None:
-        if not self.speculative_config:
+        if not self.speculative_config or not self._mtp_debug_enabled():
             return
         step = getattr(self, "_mtp_debug_step", 0)
         sampled = sampler_output.sampled_token_ids
@@ -780,7 +785,7 @@ class NPUModelRunner(GPUModelRunner):
             self._mtp_debug_log_sequence(req_id, req_idx, step, phase="post", round_accepted=round_accepted)
 
     def _mtp_debug_log_next_drafts(self, draft_token_ids: torch.Tensor | list[list[int]] | None) -> None:
-        if not self.speculative_config or draft_token_ids is None:
+        if not self.speculative_config or draft_token_ids is None or not self._mtp_debug_enabled():
             return
         step = getattr(self, "_mtp_debug_step", 0)
         if torch.is_tensor(draft_token_ids):
