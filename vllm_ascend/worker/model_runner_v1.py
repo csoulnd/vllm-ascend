@@ -136,6 +136,7 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
+    _EXTRA_CTX,
     MoECommType,
     get_mc2_tokens_capacity,
     select_moe_comm_method,
@@ -575,6 +576,18 @@ class NPUModelRunner(GPUModelRunner):
     @staticmethod
     def _mtp_dump_enabled() -> bool:
         return envs.VLLM_ASCEND_MTP_DUMP
+
+    @staticmethod
+    def _gdn_dump_enabled() -> bool:
+        return envs.VLLM_ASCEND_GDN_DUMP
+
+    def _publish_mtp_forward_step(self) -> int | None:
+        """Expose target forward step to GDN dump hooks inside the same forward."""
+        if not (self._gdn_dump_enabled() or self._mtp_dump_enabled() or self._mtp_debug_enabled()):
+            return None
+        step = self._mtp_forward_bump_step()
+        _EXTRA_CTX.mtp_forward_step = step
+        return step
 
     def _mtp_forward_bump_step(self) -> int:
         if not getattr(self, "_mtp_forward_step_set", False):
@@ -1649,7 +1662,8 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
-            dump_step = self._mtp_forward_bump_step() if self._mtp_dump_enabled() else None
+            published_step = self._publish_mtp_forward_step()
+            dump_step = published_step if self._mtp_dump_enabled() else None
             dump_inputs = None
             if dump_step is not None:
                 dump_inputs = self._mtp_dump_collect_forward_inputs(
