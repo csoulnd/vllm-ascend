@@ -46,6 +46,8 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend import envs
+
 
 # `spec_manager_map` in single_type_kv_cache_manager is a module-level dict
 # whose keys are class objects bound at import time.  When the async
@@ -899,14 +901,15 @@ class RecomputeScheduler(Scheduler):
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
                 # === MTP debug (temporary; search [MTP] to remove) ===
-                prompt_ids = list(getattr(request, "prompt_token_ids", []) or [])
-                gen_output = list(request.output_token_ids)
-                print(
-                    f"[MTP][sched] req={req_id} generated={generated_token_ids} "
-                    f"accepted={new_token_ids} gen_output={gen_output} "
-                    f"full_seq={prompt_ids + gen_output} "
-                    f"num_computed={request.num_computed_tokens}"
-                )
+                if envs.VLLM_ASCEND_MTP_DEBUG:
+                    prompt_ids = list(getattr(request, "prompt_token_ids", []) or [])
+                    gen_output = list(request.output_token_ids)
+                    print(
+                        f"[MTP][sched] req={req_id} generated={generated_token_ids} "
+                        f"accepted={new_token_ids} gen_output={gen_output} "
+                        f"full_seq={prompt_ids + gen_output} "
+                        f"num_computed={request.num_computed_tokens}"
+                    )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED

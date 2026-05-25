@@ -109,6 +109,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # Enable temporary MTP speculative-decoding debug prints ([MTP][pre/post/seq/next/sched]).
+    # Default is disabled. Set to 1 when debugging MTP accuracy issues.
+    "VLLM_ASCEND_MTP_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_MTP_DEBUG", "0"))),
 }
 
 # end-env-vars-definition
