@@ -112,6 +112,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable temporary MTP speculative-decoding debug prints ([MTP][pre/post/seq/next/sched]).
     # Default is disabled. Set to 1 when debugging MTP accuracy issues.
     "VLLM_ASCEND_MTP_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_MTP_DEBUG", "0"))),
+    # Dump target-model forward inputs/outputs per step for cross-run precision comparison.
+    # Saves structured .pt files under VLLM_ASCEND_MTP_DUMP_DIR. Default is disabled.
+    "VLLM_ASCEND_MTP_DUMP": lambda: bool(int(os.getenv("VLLM_ASCEND_MTP_DUMP", "0"))),
+    # Directory to store MTP forward dump files. Created automatically if missing.
+    "VLLM_ASCEND_MTP_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_MTP_DUMP_DIR", "/tmp/mtp_dump"),
+    # Comma-separated 1-based step ids to dump, e.g. "1,2,3". Use "all" (default) to dump every step.
+    "VLLM_ASCEND_MTP_DUMP_STEPS": lambda: os.getenv("VLLM_ASCEND_MTP_DUMP_STEPS", "all"),
 }
 
 # end-env-vars-definition

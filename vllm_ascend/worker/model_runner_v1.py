@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -126,6 +127,7 @@ from vllm_ascend.utils import (
     enable_sp_by_pass,
     get_c_env,
     global_stream,
+    is_310p,
     lmhead_tp_enable,
     set_weight_prefetch_method,
     should_skip_allreduce_across_dp_group,
@@ -570,6 +572,113 @@ class NPUModelRunner(GPUModelRunner):
     def _mtp_debug_enabled() -> bool:
         return envs.VLLM_ASCEND_MTP_DEBUG
 
+    @staticmethod
+    def _mtp_dump_enabled() -> bool:
+        return envs.VLLM_ASCEND_MTP_DUMP
+
+    def _mtp_forward_bump_step(self) -> int:
+        if not getattr(self, "_mtp_forward_step_set", False):
+            self._mtp_debug_step = getattr(self, "_mtp_debug_step", 0) + 1
+            self._mtp_forward_step_set = True
+        return self._mtp_debug_step
+
+    @staticmethod
+    def _mtp_dump_to_cpu(value: torch.Tensor | None) -> torch.Tensor | None:
+        if value is None:
+            return None
+        return value.detach().cpu()
+
+    def _mtp_dump_should_save(self, step: int) -> bool:
+        if not self._mtp_dump_enabled():
+            return False
+        steps_filter = envs.VLLM_ASCEND_MTP_DUMP_STEPS
+        if not steps_filter or steps_filter.lower() == "all":
+            return True
+        allowed = {int(part.strip()) for part in steps_filter.split(",") if part.strip()}
+        return step in allowed
+
+    def _mtp_dump_collect_forward_inputs(
+        self,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        num_reqs: int,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        logits_indices: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> dict[str, Any]:
+        num_tokens = min(num_tokens_unpadded, num_tokens_padded)
+        if input_ids is not None:
+            ids = input_ids[:num_tokens]
+        elif self.input_ids is not None:
+            ids = self.input_ids.gpu[:num_tokens]
+        else:
+            ids = None
+        pos = positions[:num_tokens] if positions is not None else None
+        embeds = inputs_embeds[:num_tokens] if inputs_embeds is not None else None
+        cu = self.query_start_loc.cpu[: num_reqs + 1]
+        per_req_input_ids: list[list[int]] = []
+        for req_idx in range(num_reqs):
+            start, end = int(cu[req_idx]), int(cu[req_idx + 1])
+            end = min(end, num_tokens)
+            if end <= start:
+                per_req_input_ids.append([])
+                continue
+            per_req_input_ids.append(ids[start:end].detach().cpu().tolist() if ids is not None else [])
+        spec_info: dict[str, Any] | None = None
+        if spec_decode_metadata is not None:
+            spec_info = {
+                "draft_token_ids": self._mtp_dump_to_cpu(spec_decode_metadata.draft_token_ids),
+                "target_logits_indices": self._mtp_dump_to_cpu(spec_decode_metadata.target_logits_indices),
+                "bonus_logits_indices": self._mtp_dump_to_cpu(spec_decode_metadata.bonus_logits_indices),
+                "logits_indices": self._mtp_dump_to_cpu(spec_decode_metadata.logits_indices),
+            }
+        return {
+            "input_ids": self._mtp_dump_to_cpu(ids),
+            "positions": self._mtp_dump_to_cpu(pos),
+            "inputs_embeds": self._mtp_dump_to_cpu(embeds),
+            "logits_indices": self._mtp_dump_to_cpu(logits_indices),
+            "query_start_loc": self._mtp_dump_to_cpu(cu),
+            "per_req_input_ids": per_req_input_ids,
+            "spec_decode": spec_info,
+        }
+
+    def _mtp_dump_save_forward(
+        self,
+        step: int,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        num_reqs: int,
+        forward_inputs: dict[str, Any],
+        hidden_states: torch.Tensor | IntermediateTensors | None,
+        sample_hidden_states: torch.Tensor | None,
+    ) -> None:
+        if not self._mtp_dump_should_save(step):
+            return
+        dump_dir = envs.VLLM_ASCEND_MTP_DUMP_DIR
+        os.makedirs(dump_dir, exist_ok=True)
+        path_tag = "310p" if is_310p() else "910"
+        num_tokens = min(num_tokens_unpadded, num_tokens_padded)
+        outputs: dict[str, Any] = {}
+        if isinstance(hidden_states, torch.Tensor):
+            outputs["hidden_states"] = self._mtp_dump_to_cpu(hidden_states[:num_tokens])
+        if sample_hidden_states is not None:
+            outputs["sample_hidden_states"] = self._mtp_dump_to_cpu(sample_hidden_states)
+        record = {
+            "step": step,
+            "path": path_tag,
+            "model": "target",
+            "req_ids": list(self.input_batch.req_ids[:num_reqs]),
+            "num_tokens_unpadded": num_tokens_unpadded,
+            "num_tokens_padded": num_tokens_padded,
+            "inputs": forward_inputs,
+            "outputs": outputs,
+        }
+        dump_path = os.path.join(dump_dir, f"forward_step{step:04d}_{path_tag}.pt")
+        torch.save(record, dump_path)
+        logger.info("MTP forward dump saved: %s", dump_path)
+
     def _mtp_debug_get_output_seq(self) -> dict[str, list[int]]:
         if not hasattr(self, "_mtp_debug_seq_store"):
             self._mtp_debug_seq_store: dict[str, list[int]] = {}
@@ -628,11 +737,6 @@ class NPUModelRunner(GPUModelRunner):
             f"full_seq={prompt_tokens + gen_output}"
         )
 
-    def _mtp_debug_bump_step(self) -> int:
-        step = getattr(self, "_mtp_debug_step", 0) + 1
-        self._mtp_debug_step = step
-        return step
-
     def _mtp_debug_log_pre_forward(
         self,
         scheduler_output: "SchedulerOutput",
@@ -642,7 +746,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         if not self.speculative_config or not self._mtp_debug_enabled():
             return
-        step = self._mtp_debug_bump_step()
+        step = self._mtp_forward_bump_step()
         md = spec_decode_metadata
         inputs_at_li = self.input_ids.gpu[md.logits_indices].detach().cpu().tolist()
         cu = self.query_start_loc.cpu[: num_reqs + 1]
@@ -1306,6 +1410,7 @@ class NPUModelRunner(GPUModelRunner):
                 logger.warning("RoutedExpertsCapturer is not initialized.")
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+        self._mtp_forward_step_set = False
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
         # spec_decoding info in scheduler_output with async_scheduling.
@@ -1544,11 +1649,25 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            dump_step = self._mtp_forward_bump_step() if self._mtp_dump_enabled() else None
+            dump_inputs = None
+            if dump_step is not None:
+                dump_inputs = self._mtp_dump_collect_forward_inputs(
+                    num_tokens_unpadded,
+                    num_tokens_padded,
+                    num_reqs,
+                    input_ids,
+                    positions,
+                    inputs_embeds,
+                    logits_indices,
+                    spec_decode_metadata,
+                )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
+            sample_hidden_states_for_dump = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
             if self.pcp_size > 1:
@@ -1584,6 +1703,7 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states_for_dump = sample_hidden_states
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
@@ -1595,6 +1715,7 @@ class NPUModelRunner(GPUModelRunner):
                     logits = None
                 else:
                     sample_hidden_states = hidden_states[logits_indices]
+                    sample_hidden_states_for_dump = sample_hidden_states
                     logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
@@ -1605,6 +1726,17 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+            if dump_step is not None and dump_inputs is not None and isinstance(hidden_states, torch.Tensor):
+                self._mtp_dump_save_forward(
+                    dump_step,
+                    num_tokens_unpadded,
+                    num_tokens_padded,
+                    num_reqs,
+                    dump_inputs,
+                    hidden_states,
+                    sample_hidden_states_for_dump,
+                )
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
