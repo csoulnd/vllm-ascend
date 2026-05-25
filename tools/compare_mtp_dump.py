@@ -9,6 +9,11 @@ req_ids / step / path / num_tokens are informational — never scored.
 Example:
   python tools/compare_mtp_dump.py ref.pt cmp.pt
   python tools/compare_mtp_dump.py ref.pt cmp.pt --cosine-min 0.9999
+
+  # GDN operator dumps (VLLM_ASCEND_GDN_DUMP=1):
+  python tools/compare_mtp_dump.py \\
+    /tmp/gdn_dump/golden/gdn_step0002_L0_causal_conv_spec_910.pt \\
+    /tmp/gdn_dump/310p/gdn_step0002_L0_causal_conv_spec_310p.pt
 """
 
 from __future__ import annotations
@@ -205,6 +210,23 @@ def compare_optional_tensor(
     section.add(name, ok, detail)
 
 
+def _compare_tensor_entry(
+    section: SectionReport,
+    name: str,
+    ref_v: Any,
+    cmp_v: Any,
+    *,
+    embeds_atol: float,
+) -> None:
+    if isinstance(ref_v, torch.Tensor) or isinstance(cmp_v, torch.Tensor):
+        compare_optional_tensor(section, name, ref_v, cmp_v, embeds_atol=embeds_atol)
+        return
+    if ref_v == cmp_v:
+        section.add(name, True, "OK")
+    else:
+        section.add(name, False, f"ref={ref_v!r} cmp={cmp_v!r}")
+
+
 def compare_inputs(
     ref_rec: dict[str, Any],
     cmp_rec: dict[str, Any],
@@ -214,6 +236,18 @@ def compare_inputs(
     section = SectionReport()
     ref_in = ref_rec.get("inputs") or {}
     cmp_in = cmp_rec.get("inputs") or {}
+    is_gdn_op = "op" in ref_rec or "op" in cmp_rec
+
+    if is_gdn_op:
+        for key in sorted(set(ref_in.keys()) | set(cmp_in.keys())):
+            _compare_tensor_entry(
+                section,
+                f"inputs.{key}",
+                ref_in.get(key),
+                cmp_in.get(key),
+                embeds_atol=embeds_atol,
+            )
+        return section
 
     for key in FORWARD_INPUT_KEYS:
         name = f"inputs.{key}"
@@ -292,8 +326,10 @@ def compare_outputs(
     section = SectionReport()
     ref_out = ref_rec.get("outputs") or {}
     cmp_out = cmp_rec.get("outputs") or {}
+    is_gdn_op = "op" in ref_rec or "op" in cmp_rec
+    out_keys = sorted(set(ref_out.keys()) | set(cmp_out.keys())) if is_gdn_op else list(OUTPUT_COSINE_KEYS)
 
-    for key in OUTPUT_COSINE_KEYS:
+    for key in out_keys:
         name = f"outputs.{key}"
         ref_t, cmp_t = ref_out.get(key), cmp_out.get(key)
         if ref_t is None and cmp_t is None:
@@ -328,6 +364,9 @@ def collect_info_notes(ref_rec: dict[str, Any], cmp_rec: dict[str, Any]) -> list
         cmp_v = cmp_rec.get(key) if key != "req_ids" else cmp_rec.get("req_ids")
         if ref_v != cmp_v:
             notes.append(f"{key}: ref={ref_v!r} cmp={cmp_v!r}")
+    for key in ("op", "layer_prefix", "layer_index"):
+        if key in ref_rec or key in cmp_rec:
+            notes.append(f"{key}: ref={ref_rec.get(key)!r} cmp={cmp_rec.get(key)!r}")
     return notes
 
 
@@ -387,6 +426,8 @@ def main() -> int:
 
     print(f"REF: {ref_path}")
     print(f"CMP: {cmp_path}")
+    if ref_rec.get("op"):
+        print(f"GDN op={ref_rec.get('op')} layer={ref_rec.get('layer_prefix')}")
     print(f"cosine_min={args.cosine_min}")
     print()
 

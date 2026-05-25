@@ -19,6 +19,7 @@
 
 import torch
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -28,6 +29,7 @@ from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_r
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.fused_recurrent_gated_delta_rule import fused_recurrent_gated_delta_rule_pytorch
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
+from vllm_ascend.debug.gdn_op_dump import mark_gdn_dump_done, save_gdn_op_dump, should_dump_gdn_spec_ops
 from vllm_ascend.utils import enable_sp
 
 
@@ -96,10 +98,14 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
         activation_num = 1 if self.activation else 0
+        dump_gdn_ops = should_dump_gdn_spec_ops(self.prefix, attn_metadata)
+        dump_pure_spec = dump_gdn_ops and attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
             has_initial_state_spec = [1] * (spec_query_start_loc.shape[0] - 1)
+            if dump_pure_spec:
+                conv_input = mixed_qkv_spec.detach().clone()
             mixed_qkv_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
                 mixed_qkv_spec,
                 conv_weights,
@@ -113,6 +119,21 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                 pad_slot_id=PAD_SLOT_ID,
                 run_mode=1,
             )
+            if dump_pure_spec:
+                dump_path = save_gdn_op_dump(
+                    layer_prefix=self.prefix,
+                    op_name="causal_conv_spec",
+                    inputs={
+                        "mixed_qkv": conv_input,
+                        "query_start_loc": to_int64_tuple(spec_query_start_loc),
+                        "cache_indices": to_int64_tuple(
+                            spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes]
+                        ),
+                        "num_accepted_tokens": to_int64_tuple(num_accepted_tokens),
+                    },
+                    outputs={"mixed_qkv": mixed_qkv_spec},
+                )
+                logger.info("GDN op dump saved: %s", dump_path)
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -186,6 +207,24 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
                 )
+                if dump_pure_spec:
+                    dump_path = save_gdn_op_dump(
+                        layer_prefix=self.prefix,
+                        op_name="recurrent_spec",
+                        inputs={
+                            "query": query_spec,
+                            "key": key_spec,
+                            "value": value_spec,
+                            "g": g_spec,
+                            "beta": beta_spec,
+                            "cu_seqlens": spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
+                            "ssm_state_indices": spec_state_indices_tensor,
+                            "num_accepted_tokens": num_accepted_tokens,
+                        },
+                        outputs={"core_attn_out": core_attn_out_spec},
+                    )
+                    logger.info("GDN op dump saved: %s", dump_path)
+                    mark_gdn_dump_done()
             else:
                 core_attn_out_spec, last_recurrent_state = None, None
 

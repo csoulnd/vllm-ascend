@@ -122,6 +122,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_MTP_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_MTP_DUMP_DIR", "/tmp/mtp_dump"),
     # Comma-separated 1-based step ids to dump, e.g. "1,2,3". Use "all" (default) to dump every step.
     "VLLM_ASCEND_MTP_DUMP_STEPS": lambda: os.getenv("VLLM_ASCEND_MTP_DUMP_STEPS", "all"),
+    # Dump first-verify GDN spec-path operator I/O (causal_conv + recurrent) on one linear_attn layer.
+    # Saves .pt under VLLM_ASCEND_GDN_DUMP_DIR. At most one layer x two ops per process.
+    "VLLM_ASCEND_GDN_DUMP": lambda: bool(int(os.getenv("VLLM_ASCEND_GDN_DUMP", "0"))),
+    "VLLM_ASCEND_GDN_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_GDN_DUMP_DIR", "/tmp/gdn_dump"),
+    # Target model-runner forward step (1=prefill, 2=first MTP verify by default).
+    "VLLM_ASCEND_GDN_DUMP_STEP": lambda: os.getenv("VLLM_ASCEND_GDN_DUMP_STEP", "2"),
+    # Model layer index in prefix (e.g. model.layers.3.linear_attn -> 3).
+    "VLLM_ASCEND_GDN_DUMP_LAYER": lambda: os.getenv("VLLM_ASCEND_GDN_DUMP_LAYER", "0"),
 }
 
 # end-env-vars-definition

@@ -338,6 +338,7 @@ class _ExtraForwardContextProxy:
         "num_accept_tokens",
         "in_profile_run",
         "padded_num_tokens",
+        "mtp_forward_step",
     )
 
     def check_extra_attr(self, name: str):
