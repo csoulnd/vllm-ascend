@@ -148,3 +148,61 @@ def test_causal_conv1d_310_update(batch_size, dim, width, seqlen, has_bias, silu
     validate_cmp(
         conv_states_origin[unused_states_bool], conv_state_for_padding_test[unused_states_bool].transpose(-1, -2)
     )
+
+
+@pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
+@pytest.mark.parametrize("itype", [torch.float16])
+@pytest.mark.parametrize("silu_activation", [True])
+@pytest.mark.parametrize("has_bias", [True])
+@pytest.mark.parametrize("width", [4])
+@pytest.mark.parametrize("dim", [2048])
+def test_causal_conv1d_310_decode_varlen_grouped(itype, has_bias, silu_activation, width, dim):
+    """Decode with multiple tokens per request must use query_start_loc (varlen grouping)."""
+    device = "npu"
+    enable_custom_op()
+    seq_lens = [1, 3, 2, 4]
+    num_seq = len(seq_lens)
+    total_tokens = sum(seq_lens)
+    total_entries = 10 * num_seq
+
+    x = torch.randn(total_tokens, dim, device=device, dtype=itype)
+    x_ref = x.clone()
+    query_start_loc = torch.cumsum(
+        torch.tensor([0] + seq_lens, device=device, dtype=torch.int32),
+        dim=0,
+    )
+    cache_indices = torch.randperm(total_entries, device=device)[:num_seq].to(torch.int32)
+    conv_states = torch.randn(total_entries, width, dim, device=device, dtype=itype).transpose(-1, -2)
+    conv_states_ref = conv_states[cache_indices, :].detach().clone()
+    conv_states_origin = conv_states.transpose(-1, -2)
+
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    activation = None if not silu_activation else "silu"
+    activation_mode = 1 if activation else 0
+
+    out = torch.ops._C_ascend.npu_causal_conv1d_310(
+        x,
+        weight.transpose(-1, -2),
+        bias=bias,
+        conv_states=conv_states_origin,
+        query_start_loc=query_start_loc.to(torch.int64),
+        cache_indices=cache_indices.to(torch.int64),
+        initial_state_mode=None,
+        num_accepted_tokens=None,
+        activation_mode=activation_mode,
+        pad_slot_id=PAD_SLOT_ID,
+        run_mode=1,
+    )
+
+    out_ref = causal_conv1d_update_ref(
+        x_ref,
+        conv_states_ref,
+        weight,
+        bias,
+        activation=activation,
+        conv_state_indices=cache_indices,
+        query_start_loc=query_start_loc,
+    )
+    validate_cmp(out, out_ref)
+    validate_cmp(conv_states_origin[cache_indices, :], conv_states_ref.transpose(-1, -2))

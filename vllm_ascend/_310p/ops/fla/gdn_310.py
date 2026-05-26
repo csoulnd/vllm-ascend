@@ -189,13 +189,17 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     run_mode=0,
                 )
         elif attn_metadata.num_decodes > 0:
+            # Varlen grouping via query_start_loc: without it, each token is treated as an
+            # independent batch row (inputMode=2) and parallel blocks race on the same
+            # conv_states slot when multiple tokens map to one request.
+            num_decodes = attn_metadata.num_decodes
             mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
                 mixed_qkv_non_spec,
                 conv_weights,
                 bias=self.conv1d.bias,
                 conv_states=conv_state,
-                query_start_loc=None,
-                cache_indices=non_spec_state_indices_tensor[: attn_metadata.num_actual_tokens].to(torch.int64),
+                query_start_loc=non_spec_query_start_loc[: num_decodes + 1].to(torch.int64),
+                cache_indices=non_spec_state_indices_tensor[:num_decodes].to(torch.int64),
                 initial_state_mode=None,
                 num_accepted_tokens=None,
                 activation_mode=activation_num,
