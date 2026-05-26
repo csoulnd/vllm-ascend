@@ -121,7 +121,7 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
         context_layer = torch.empty_like(q)
 
         # operator requires pta version >= 2.5.1
-        torch_npu._npu_flash_attention_unpad(
+        torch_npu._npu_flash_attention_unpad_v2(
             query=q,
             key=k,
             value=v,
@@ -130,6 +130,7 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             out=context_layer,
+            kernel_type=2,
         )
 
         if self.enable_pad:
