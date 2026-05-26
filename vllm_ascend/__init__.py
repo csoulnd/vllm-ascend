@@ -15,6 +15,18 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import sys
+from unittest.mock import MagicMock
+
+# Mock torch_npu._inductor to avoid triton import at module-load time.
+# vLLM upstream modules (e.g. topk_topp_sampler) may use @torch.compile(dynamic=True)
+# on class methods, which triggers torch_npu._dynamo -> register_inductor_npu()
+# -> import torch_npu._inductor -> import triton. In environments without triton,
+# this causes an early ImportError before any config can disable compilation.
+# The same pattern is already used in test files (e.g. tests/ut/attention/test_sfa_v1.py).
+if "torch_npu._inductor" not in sys.modules:
+    sys.modules["torch_npu._inductor"] = MagicMock()
+
 _GLOBAL_PATCH_APPLIED = False
 
 
