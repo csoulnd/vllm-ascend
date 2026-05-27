@@ -2288,6 +2288,20 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_causal_conv1d_310", torch::kPrivateUse1, &vllm_ascend::npu_causal_conv1d_310);
 
     ops.def(
+        "npu_causal_conv1d_310_custom(Tensor output, Tensor x, "
+        "                               Tensor weight, "
+        "                               Tensor conv_states, "
+        "                               Tensor? bias_opt, "
+        "                               int[] query_start_loc_opt, "
+        "                               int[] cache_indices_opt, "
+        "                               int[] initial_state_mode_opt, "
+        "                               int[] num_accepted_tokens_opt, "
+        "                               int activation_mode, "
+        "                               int pad_slot_id, "
+        "                               int run_mode) -> Tensor");
+    ops.impl("npu_causal_conv1d_310_custom", torch::kPrivateUse1, &vllm_ascend::npu_causal_conv1d_310_custom);
+
+    ops.def(
         "npu_recurrent_gated_delta_rule_310(Tensor query, "
         "                                   Tensor key, "
         "                                   Tensor value, "
