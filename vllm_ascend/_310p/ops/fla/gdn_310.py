@@ -42,6 +42,60 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return F.normalize(x.to(torch.float32), p=2, dim=-1, eps=eps).to(x.dtype)
 
 
+def _align_mtp_spec_causal_conv1d_inputs_if_needed(
+    mixed_qkv_spec: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    spec_state_indices_tensor: torch.Tensor,
+    num_accepted_tokens: torch.Tensor | None,
+    num_spec_decodes: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
+    """Return aligned inputs only when qsl batch != cache_indices batch."""
+    spec_qsl = spec_query_start_loc.to(torch.int64)
+    batch_from_qsl = spec_qsl.numel() - 1
+    cache_indices = spec_state_indices_tensor[:, 0][:num_spec_decodes].to(torch.int64)
+    if batch_from_qsl <= 0 or cache_indices.numel() == batch_from_qsl:
+        return None
+
+    num_tokens = mixed_qkv_spec.shape[0]
+    query_len = 1
+    if spec_state_indices_tensor.ndim >= 2 and spec_state_indices_tensor.shape[-1] > 1:
+        query_len = spec_state_indices_tensor.shape[-1]
+    elif num_spec_decodes > 0 and num_tokens % num_spec_decodes == 0:
+        query_len = num_tokens // num_spec_decodes
+    if query_len <= 0 or num_tokens % query_len != 0:
+        query_len = 1
+
+    batch = num_tokens // query_len
+    spec_qsl = torch.arange(
+        0,
+        num_tokens + 1,
+        query_len,
+        dtype=torch.int64,
+        device=spec_qsl.device,
+    )
+    if cache_indices.numel() < batch:
+        padded = torch.zeros(batch, dtype=torch.int64, device=cache_indices.device)
+        if cache_indices.numel() > 0:
+            padded[: cache_indices.numel()] = cache_indices
+        cache_indices = padded
+    else:
+        cache_indices = cache_indices[:batch].contiguous()
+
+    if num_accepted_tokens is None:
+        aligned_nat = torch.zeros(batch, dtype=torch.int64, device=cache_indices.device)
+    elif num_accepted_tokens.numel() >= batch:
+        aligned_nat = num_accepted_tokens[:batch].to(torch.int64).contiguous()
+    else:
+        aligned_nat = torch.zeros(batch, dtype=torch.int64, device=num_accepted_tokens.device)
+        aligned_nat[: num_accepted_tokens.numel()] = num_accepted_tokens.to(torch.int64)
+
+    if query_len > 1:
+        mixed_qkv_in = mixed_qkv_spec.view(batch, query_len, mixed_qkv_spec.shape[-1])
+    else:
+        mixed_qkv_in = mixed_qkv_spec
+    return mixed_qkv_in, spec_qsl, cache_indices, aligned_nat
+
+
 def _flatten_state_indices(
     ssm_state_indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -168,22 +222,50 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
         activation_num = 1 if self.activation else 0
+        spec_qsl_for_recurrent = spec_query_start_loc
+        spec_nat_for_recurrent = num_accepted_tokens
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            mixed_qkv_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
+            aligned_spec_inputs = _align_mtp_spec_causal_conv1d_inputs_if_needed(
                 mixed_qkv_spec,
+                spec_query_start_loc,
+                spec_state_indices_tensor,
+                num_accepted_tokens,
+                attn_metadata.num_spec_decodes,
+            )
+            if aligned_spec_inputs is not None:
+                (
+                    mixed_qkv_spec_in,
+                    spec_qsl_in,
+                    spec_cache_indices,
+                    spec_num_accepted_tokens,
+                ) = aligned_spec_inputs
+            else:
+                mixed_qkv_spec_in = mixed_qkv_spec
+                spec_qsl_in = spec_query_start_loc.to(torch.int64)
+                spec_cache_indices = spec_state_indices_tensor[:, 0][
+                    : attn_metadata.num_spec_decodes
+                ].to(torch.int64)
+                spec_num_accepted_tokens = num_accepted_tokens.to(torch.int64)
+            mixed_qkv_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
+                mixed_qkv_spec_in,
                 conv_weights,
                 bias=self.conv1d.bias,
                 conv_states=conv_state,
-                query_start_loc=spec_query_start_loc.to(torch.int64),
-                cache_indices=spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes].to(torch.int64),
+                query_start_loc=spec_qsl_in,
+                cache_indices=spec_cache_indices,
                 initial_state_mode=None,
-                num_accepted_tokens=num_accepted_tokens.to(torch.int64),
+                num_accepted_tokens=spec_num_accepted_tokens,
                 activation_mode=activation_num,
                 pad_slot_id=PAD_SLOT_ID,
                 run_mode=1,
             )
+            if mixed_qkv_spec.ndim == 3:
+                batch, query_len, hidden = mixed_qkv_spec.shape
+                mixed_qkv_spec = mixed_qkv_spec.reshape(batch * query_len, hidden)
+            spec_qsl_for_recurrent = spec_qsl_in
+            spec_nat_for_recurrent = spec_num_accepted_tokens
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -250,9 +332,9 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     g=g_spec,
                     beta=beta_spec,
                     state=ssm_state,
-                    cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
-                    ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=num_accepted_tokens,
+                    cu_seqlens=spec_qsl_for_recurrent,
+                    ssm_state_indices=spec_state_indices_tensor[: spec_qsl_for_recurrent.numel() - 1],
+                    num_accepted_tokens=spec_nat_for_recurrent,
                     use_qk_l2norm_in_kernel=True,
                 )
             else:

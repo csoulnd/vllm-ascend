@@ -210,9 +210,11 @@ class NPUModelRunner310(NPUModelRunner):
                 continue
             if md.spec_sequence_masks is None:
                 continue
-            if md.num_prefills != 0 or md.num_decodes != 0:
-                continue
 
+            # build_for_cudagraph_capture() often leaves num_decodes > 0 for MTP
+            # dummy batches. Runtime verify uses pure spec (prefill=0, decode=0).
+            md.num_prefills = 0
+            md.num_decodes = 0
             md.num_spec_decodes = spec_batch
             md.num_actual_tokens = num_tokens
 
@@ -276,6 +278,8 @@ class NPUModelRunner310(NPUModelRunner):
         )
         if for_cudagraph_capture and self._should_use_mtp_spec_decoding_attn_state():
             num_tokens = kwargs.get("num_tokens")
+            if num_tokens is None and args:
+                num_tokens = args[0]
             if num_tokens is not None and isinstance(attn_metadata, dict):
                 self._align_gdn_mtp_cudagraph_capture_metadata(attn_metadata, num_tokens)
         return attn_metadata, spec_cm
