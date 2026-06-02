@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
@@ -181,14 +182,103 @@ class NPUModelRunner310(NPUModelRunner):
             num_encoder_reqs=num_encoder_reqs,
         )
 
+    def _align_gdn_mtp_cudagraph_capture_metadata(
+        self,
+        attn_metadata: dict[str, Any],
+        num_tokens: int,
+    ) -> None:
+        """Align GDN spec metadata batch dim for CausalConv1dV310 during capture.
+
+        build_for_cudagraph_capture() may inherit padded query_start_loc (batch
+        = num_reqs_padded) while num_spec_decodes / cache_indices reflect the
+        actual spec request count. CausalConv1dV310 tiling requires
+        cacheIndices.size == query_start_loc.size - 1 == num_tokens / q_len.
+        """
+        if not self._has_gdn:
+            return
+
+        uniform_query_len = self.uniform_decode_query_len
+        if uniform_query_len <= 0 or num_tokens % uniform_query_len != 0:
+            return
+
+        spec_batch = num_tokens // uniform_query_len
+        if spec_batch <= 0:
+            return
+
+        for md in attn_metadata.values():
+            if not isinstance(md, GDNAttentionMetadata):
+                continue
+            if md.spec_sequence_masks is None:
+                continue
+            if md.num_prefills != 0 or md.num_decodes != 0:
+                continue
+
+            md.num_spec_decodes = spec_batch
+            md.num_actual_tokens = num_tokens
+
+            qsl_dtype = (
+                md.spec_query_start_loc.dtype
+                if md.spec_query_start_loc is not None
+                else torch.int64
+            )
+            qsl_device = (
+                md.spec_query_start_loc.device
+                if md.spec_query_start_loc is not None
+                else self.device
+            )
+            md.spec_query_start_loc = torch.arange(
+                0,
+                num_tokens + 1,
+                uniform_query_len,
+                dtype=qsl_dtype,
+                device=qsl_device,
+            )
+
+            if md.spec_state_indices_tensor is not None:
+                state_indices = md.spec_state_indices_tensor
+                if state_indices.shape[0] < spec_batch:
+                    pad_rows = spec_batch - state_indices.shape[0]
+                    pad_shape = (pad_rows,) + tuple(state_indices.shape[1:])
+                    pad = torch.zeros(
+                        pad_shape,
+                        dtype=state_indices.dtype,
+                        device=state_indices.device,
+                    )
+                    state_indices = torch.cat([state_indices, pad], dim=0)
+                md.spec_state_indices_tensor = state_indices[:spec_batch].contiguous()
+
+            if md.num_accepted_tokens is None:
+                md.num_accepted_tokens = torch.zeros(
+                    spec_batch,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            elif md.num_accepted_tokens.numel() < spec_batch:
+                padded = torch.zeros(
+                    spec_batch,
+                    dtype=md.num_accepted_tokens.dtype,
+                    device=md.num_accepted_tokens.device,
+                )
+                copy_len = min(md.num_accepted_tokens.numel(), spec_batch)
+                if copy_len > 0:
+                    padded[:copy_len] = md.num_accepted_tokens[:copy_len]
+                md.num_accepted_tokens = padded
+            else:
+                md.num_accepted_tokens = md.num_accepted_tokens[:spec_batch].contiguous()
+
     def _build_attention_metadata(self, *args, for_cudagraph_capture: bool = False, **kwargs):
         # Parent dummy_run assigns ChunkedPrefill for non-MLA MTP before building
         # metadata. 310P MTP verify replays splitfuse via SpecDecoding instead.
         if for_cudagraph_capture and self._should_use_mtp_spec_decoding_attn_state():
             self.attn_state = AscendAttentionState.SpecDecoding
-        return super()._build_attention_metadata(
+        attn_metadata, spec_cm = super()._build_attention_metadata(
             *args, for_cudagraph_capture=for_cudagraph_capture, **kwargs
         )
+        if for_cudagraph_capture and self._should_use_mtp_spec_decoding_attn_state():
+            num_tokens = kwargs.get("num_tokens")
+            if num_tokens is not None and isinstance(attn_metadata, dict):
+                self._align_gdn_mtp_cudagraph_capture_metadata(attn_metadata, num_tokens)
+        return attn_metadata, spec_cm
 
     def _pad_query_start_loc_for_fia(
         self,
