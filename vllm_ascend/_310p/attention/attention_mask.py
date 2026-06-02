@@ -25,6 +25,9 @@ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_2d, nd_to_nz_spec
 class AttentionMaskBuilder310:
     chunked_prefill_attn_mask = None
     max_seqlen = 16384
+    # Reuse NZ splitfuse masks per row count so ACLGraph replay sees stable
+    # tensor addresses across iterations.
+    _splitfuse_mask_nz_buffers: dict[int, torch.Tensor] = {}
 
     def __init__(self, device: torch.device, max_seqlen: int):
         """
@@ -86,8 +89,25 @@ class AttentionMaskBuilder310:
         pos_list = [p for ql, cl in zip(q_list, c_list) for p in range(cl - ql, cl)]
         position = torch.tensor(pos_list, dtype=torch.int32, device=device)
         splitfuse_mask = cls.chunked_prefill_attn_mask.index_select(0, position)
-        splitfuse_mask_nz = torch_npu.npu_format_cast(nd_to_nz_spec(splitfuse_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
-        return splitfuse_mask_nz
+        splitfuse_mask_nz = torch_npu.npu_format_cast(
+            nd_to_nz_spec(splitfuse_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ
+        )
+        return cls._reuse_splitfuse_mask_nz_buffer(num_rows=len(pos_list), splitfuse_mask_nz=splitfuse_mask_nz)
+
+    @classmethod
+    def _reuse_splitfuse_mask_nz_buffer(cls, num_rows: int, splitfuse_mask_nz: torch.Tensor) -> torch.Tensor:
+        cached = cls._splitfuse_mask_nz_buffers.get(num_rows)
+        if (
+            cached is None
+            or cached.shape != splitfuse_mask_nz.shape
+            or cached.dtype != splitfuse_mask_nz.dtype
+            or cached.device != splitfuse_mask_nz.device
+        ):
+            cls._splitfuse_mask_nz_buffers[num_rows] = splitfuse_mask_nz
+            return splitfuse_mask_nz
+
+        cached.copy_(splitfuse_mask_nz)
+        return cached
 
     def get_attention_mask(self, causal: bool, model_config) -> torch.Tensor:
         """

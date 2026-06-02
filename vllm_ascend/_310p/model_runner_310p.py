@@ -88,6 +88,13 @@ class NPUModelRunner310(NPUModelRunner):
             # Keep dispatcher's internal query_len in sync to avoid key-init assert.
             self.cudagraph_dispatcher.uniform_decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN
 
+    def _should_use_mtp_spec_decoding_attn_state(self, uniform_decode: bool = False) -> bool:
+        return (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and (uniform_decode or self.attn_state == AscendAttentionState.SpecDecoding)
+        )
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred = super()._update_states(scheduler_output)
         if scheduler_output.finished_req_ids:
@@ -132,9 +139,16 @@ class NPUModelRunner310(NPUModelRunner):
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
     ):
-        if self.attn_state in (AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit):
+        # Prefill-style attention states cannot replay ACLGraph on 310P, except
+        # during explicit uniform-decode graph capture where attn_state may still
+        # reflect the previous capture iteration.
+        if (
+            force_uniform_decode is not True
+            and self.attn_state in (AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit)
+        ):
             force_eager = True
 
+        uniform_decode_query_len = self.cudagraph_dispatcher.uniform_decode_query_len
         if force_uniform_decode is None and self.attn_state == AscendAttentionState.DecodeOnly:
             decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN
             if (
@@ -144,6 +158,14 @@ class NPUModelRunner310(NPUModelRunner):
             ):
                 # Respect explicit caller override: only force when unset.
                 force_uniform_decode = True
+
+        if (
+            force_uniform_decode is None
+            and self._should_use_mtp_spec_decoding_attn_state()
+            and max_num_scheduled_tokens == uniform_decode_query_len
+            and num_tokens == max_num_scheduled_tokens * num_reqs
+        ):
+            force_uniform_decode = True
 
         return super()._determine_batch_execution_and_padding(
             num_tokens=num_tokens,
@@ -157,6 +179,15 @@ class NPUModelRunner310(NPUModelRunner):
             force_has_lora=force_has_lora,
             force_num_active_loras=force_num_active_loras,
             num_encoder_reqs=num_encoder_reqs,
+        )
+
+    def _build_attention_metadata(self, *args, for_cudagraph_capture: bool = False, **kwargs):
+        # Parent dummy_run assigns ChunkedPrefill for non-MLA MTP before building
+        # metadata. 310P MTP verify replays splitfuse via SpecDecoding instead.
+        if for_cudagraph_capture and self._should_use_mtp_spec_decoding_attn_state():
+            self.attn_state = AscendAttentionState.SpecDecoding
+        return super()._build_attention_metadata(
+            *args, for_cudagraph_capture=for_cudagraph_capture, **kwargs
         )
 
     def _pad_query_start_loc_for_fia(
@@ -549,6 +580,11 @@ class NPUModelRunner310(NPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
     ):
+        # Pre-set SpecDecoding before dispatch so later capture sizes do not
+        # inherit ChunkedPrefill from the previous dummy_run iteration.
+        if uniform_decode and self._should_use_mtp_spec_decoding_attn_state(uniform_decode=True):
+            self.attn_state = AscendAttentionState.SpecDecoding
+
         temporary_context = self.temporary_modify_uniform_decode_query_len() if uniform_decode else nullcontext()
         with temporary_context:
             return super()._dummy_run(
