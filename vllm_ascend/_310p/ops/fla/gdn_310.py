@@ -104,10 +104,18 @@ def _flatten_state_indices(
     if ssm_state_indices.ndim == 1:
         return ssm_state_indices[:total_tokens].to(torch.int32).contiguous()
 
+    batch = cu_seqlens.numel() - 1
+    row_len = ssm_state_indices.shape[1]
+    ssm_state_indices = ssm_state_indices[:batch]
+
+    # Uniform per-request length (MTP spec verify / decode graph capture):
+    # avoid masked_select, which is not ACLGraph-capture friendly.
+    if batch > 0 and row_len > 0 and batch * row_len == total_tokens:
+        return ssm_state_indices.reshape(-1).to(torch.int32).contiguous()
+
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    ssm_state_indices = ssm_state_indices[: seq_lens.shape[0]]
     positions = torch.arange(
-        ssm_state_indices.shape[1],
+        row_len,
         device=ssm_state_indices.device,
         dtype=seq_lens.dtype,
     )
@@ -333,7 +341,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     beta=beta_spec,
                     state=ssm_state,
                     cu_seqlens=spec_qsl_for_recurrent,
-                    ssm_state_indices=spec_state_indices_tensor[: spec_qsl_for_recurrent.numel() - 1],
+                    ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=spec_nat_for_recurrent,
                     use_qk_l2norm_in_kernel=True,
                 )
