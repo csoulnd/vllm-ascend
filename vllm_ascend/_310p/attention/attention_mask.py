@@ -21,6 +21,21 @@ import torch_npu
 from vllm_ascend.attention.attention_v1 import AscendMetadata
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_2d, nd_to_nz_spec
 
+# op-plugin PagedAttentionSplitfuseV2: MASK_TYPE_NORM_COMPRESS (ATB enum 4 on 310P).
+MASK_TYPE_NORM_COMPRESS = 4
+# Fixed causal additive mask shape for splitfuse v2 (ND FP16).
+SPLITFUSE_V2_MASK_SIZE = 2048
+
+_attn_mask_builder_310: "AttentionMaskBuilder310 | None" = None
+
+
+def get_attn_mask_builder_310(device: torch.device, max_model_len: int) -> "AttentionMaskBuilder310":
+    """Return the process-wide 310P mask builder (same pattern as mainline ``get_attn_mask_builder``)."""
+    global _attn_mask_builder_310
+    if _attn_mask_builder_310 is None:
+        _attn_mask_builder_310 = AttentionMaskBuilder310(device, max_model_len)
+    return _attn_mask_builder_310
+
 
 class AttentionMaskBuilder310:
     chunked_prefill_attn_mask = None
@@ -37,6 +52,7 @@ class AttentionMaskBuilder310:
         AttentionMaskBuilder310.max_seqlen = max_seqlen
         self.causal_attn_mask_cache = None
         self.non_causal_attn_mask_cache = None
+        self.splitfuse_v2_causal_mask = None
         self.device = device
 
     @staticmethod
@@ -88,6 +104,18 @@ class AttentionMaskBuilder310:
         splitfuse_mask = cls.chunked_prefill_attn_mask.index_select(0, position)
         splitfuse_mask_nz = torch_npu.npu_format_cast(nd_to_nz_spec(splitfuse_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
         return splitfuse_mask_nz
+
+    def get_splitfuse_v2_causal_mask(self) -> torch.Tensor:
+        """Fixed ``2048 x 2048`` FP16 ND causal additive mask for splitfuse v2.
+
+        v1 ``get_splitfuse_mask`` uses per-row NZ masks; v2 ``MASK_TYPE_NORM_COMPRESS``
+        expects a static ND mask (no ``npu_format_cast``). Lower triangle 0, upper ``-inf``.
+        """
+        if self.splitfuse_v2_causal_mask is None:
+            self.splitfuse_v2_causal_mask = self.gen_causal_additive_mask(
+                SPLITFUSE_V2_MASK_SIZE, self.device
+            )
+        return self.splitfuse_v2_causal_mask
 
     def get_attention_mask(self, causal: bool, model_config) -> torch.Tensor:
         """

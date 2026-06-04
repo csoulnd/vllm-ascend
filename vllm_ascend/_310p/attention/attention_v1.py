@@ -19,12 +19,17 @@ from typing import Any
 
 import torch
 import torch_npu
+from vllm.logger import logger
 from vllm.v1.attention.backends.registry import (  # type: ignore
     AttentionBackendEnum,
     register_backend,
 )
 
-from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
+from vllm_ascend._310p.attention.attention_mask import (
+    MASK_TYPE_NORM_COMPRESS,
+    AttentionMaskBuilder310,
+    get_attn_mask_builder_310,
+)
 from vllm_ascend._310p.attention.metadata_builder import AscendAttentionMetadataBuilder310
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -95,6 +100,25 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
     Implementation of attention operations (Prefill, Decode, Chunked Prefill)
     optimized for the Ascend 310P architecture.
     """
+
+    _splitfuse_v2_available: bool | None = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        cls = AscendAttentionBackendImpl310
+        if cls._splitfuse_v2_available is None:
+            cls._splitfuse_v2_available = hasattr(torch_npu, "_npu_paged_attention_splitfuse_v2")
+            if cls._splitfuse_v2_available:
+                logger.info(
+                    "310P SpecDecoding will use _npu_paged_attention_splitfuse_v2 "
+                    "(MASK_TYPE_NORM_COMPRESS, FP16 ND mask)."
+                )
+            else:
+                logger.info(
+                    "310P SpecDecoding: _npu_paged_attention_splitfuse_v2 not found in torch_npu; "
+                    "falling back to _npu_paged_attention_splitfuse (v1)."
+                )
+        self.splitfuse_v2_available = cls._splitfuse_v2_available
 
     def _forward_encoder_attention(
         self,
@@ -244,8 +268,40 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         return output
 
     def forward_spec_decoding_310(self, query, attn_metadata, output):
-        """Execute SpecDecoding on 310P using full query rows plus splitfuse mask."""
-        return self.forward_chunked_prefill_310(query, attn_metadata, output)
+        """MTP spec verify via ``_npu_paged_attention_splitfuse_v2`` when available."""
+        if not self.splitfuse_v2_available:
+            return self.forward_chunked_prefill_310(query, attn_metadata, output)
+
+        num_actual_tokens = int(attn_metadata.num_actual_tokens)
+        query = query[:num_actual_tokens]
+        output = output[:num_actual_tokens]
+
+        qsl_cpu = attn_metadata.query_start_loc.cpu()
+        qlens = qsl_cpu[1:] - qsl_cpu[:-1]
+
+        context_lens = attn_metadata.seq_lens
+        block_table = attn_metadata.block_tables
+
+        if context_lens.device != query.device:
+            context_lens = context_lens.to(query.device, non_blocking=True)
+
+        mask_builder = get_attn_mask_builder_310(query.device, AttentionMaskBuilder310.max_seqlen)
+        mask = mask_builder.get_splitfuse_v2_causal_mask()
+        torch_npu._npu_paged_attention_splitfuse_v2(
+            query=query,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            block_table=block_table,
+            context_lens=context_lens,
+            mask=mask,
+            seq_len=qlens,
+            num_kv_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale_value=self.scale,
+            mask_type=MASK_TYPE_NORM_COMPRESS,
+            out=output,
+        )
+        return output
 
     def forward_impl(self, query, key, value, kv_cache, attn_metadata, output):
         """
@@ -279,7 +335,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         # Condition for PrefillCacheHit: Indicates prefill with some cached tokens already processed
         elif state in [AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit]:
             output = self.forward_chunked_prefill_310(query, attn_metadata, output)
-        # Condition for SpecDecoding: Specified for mtp, which is not supported yet.
+        # Condition for SpecDecoding: MTP spec verify (splitfuse v2 when available).
         elif state == AscendAttentionState.SpecDecoding:
             output = self.forward_spec_decoding_310(query, attn_metadata, output)
         else:
