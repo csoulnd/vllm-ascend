@@ -21,8 +21,8 @@ import torch_npu
 from vllm_ascend.attention.attention_v1 import AscendMetadata
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_2d, nd_to_nz_spec
 
-# op-plugin PagedAttentionSplitfuseV2: MASK_TYPE_NORM_COMPRESS (ATB enum 4 on 310P).
-MASK_TYPE_NORM_COMPRESS = 4
+# op-plugin PagedAttentionSplitfuseV2: MASK_TYPE_NORM_COMPRESS (ATB enum 5 on 310P).
+MASK_TYPE_NORM_COMPRESS = 5
 # Fixed causal additive mask shape for splitfuse v2 (ND FP16).
 SPLITFUSE_V2_MASK_SIZE = 2048
 
@@ -114,7 +114,7 @@ class AttentionMaskBuilder310:
         if self.splitfuse_v2_causal_mask is None:
             self.splitfuse_v2_causal_mask = self.gen_causal_additive_mask(
                 SPLITFUSE_V2_MASK_SIZE, self.device
-            )
+            ).contiguous()
         return self.splitfuse_v2_causal_mask
 
     def get_attention_mask(self, causal: bool, model_config) -> torch.Tensor:
