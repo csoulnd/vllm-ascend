@@ -119,6 +119,14 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
                 )
         self.splitfuse_v2_available = cls._splitfuse_v2_available
 
+    @staticmethod
+    def _query_lens_from_start_loc(query_start_loc: torch.Tensor) -> torch.Tensor:
+        """Per-request query lengths on the same device as ``query_start_loc``.
+
+        Avoids ``query_start_loc.cpu()`` which breaks ACL graph capture (D2H sync).
+        """
+        return query_start_loc[1:] - query_start_loc[:-1]
+
     def _forward_encoder_attention(
         self,
         query: torch.Tensor,
@@ -237,9 +245,8 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         query = query[:num_actual_tokens]
         output = output[:num_actual_tokens]
 
-        # Calculate query lengths from start locations
-        qsl_cpu = attn_metadata.query_start_loc.cpu()
-        qlens = qsl_cpu[1:] - qsl_cpu[:-1]
+        # Calculate query lengths from start locations (device-side for graph capture).
+        qlens = self._query_lens_from_start_loc(attn_metadata.query_start_loc)
 
         block_table = attn_metadata.block_tables
 
@@ -283,10 +290,9 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
                 non_blocking=True,
             )
 
-        # Per-request query lengths: derived from query_start_loc which is
-        # updated in-place during MTP / graph replay (same as splitfuse v1).
-        qsl_cpu = attn_metadata.query_start_loc.cpu()
-        qlens = qsl_cpu[1:] - qsl_cpu[:-1]
+        # Per-request query lengths: derived from device ``query_start_loc`` updated
+        # in-place during MTP / graph replay (no D2H sync during capture).
+        qlens = self._query_lens_from_start_loc(attn_metadata.query_start_loc)
 
         torch_npu._npu_paged_attention_splitfuse_v2(
             query=query,

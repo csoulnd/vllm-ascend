@@ -77,6 +77,7 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
         # Align with mainline parallel_drafting: bind the device-side seq_lens
         # view so graph replay updates the same buffer (not a CPU copy).
         attn_metadata.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        attn_metadata.query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
 
         if hasattr(torch_npu, "_npu_paged_attention_splitfuse_v2"):
             attn_metadata.attn_mask = self.attn_mask_builder.get_splitfuse_v2_causal_mask()
