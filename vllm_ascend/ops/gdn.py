@@ -172,6 +172,8 @@ def update_conv1d_graph_params(
             graph_params.conv1d_events[num_tokens],
         ):
             # Unpack parameters captured during graph capture
+            param_list = list(param)
+            op_backend = param_list[14] if len(param_list) > 14 else "custom"
             (
                 output,
                 mixed_qkv,
@@ -187,7 +189,7 @@ def update_conv1d_graph_params(
                 _,
                 _,
                 q_per_seq,
-            ) = param
+            ) = param_list[:14]
 
             new_query_start_loc: tuple[int, ...] = ()
             new_cache_indices: tuple[int, ...] = ()
@@ -227,20 +229,37 @@ def update_conv1d_graph_params(
                     new_num_accepted = ()
 
             torch.npu.graph_task_update_begin(update_stream, handle)
-            torch.ops._C_ascend.npu_causal_conv1d_custom(
-                output,
-                mixed_qkv,
-                conv_weights_T,
-                conv_state=conv_state,
-                bias_opt=bias,
-                query_start_loc_opt=new_query_start_loc,
-                cache_indices_opt=new_cache_indices,
-                initial_state_mode_opt=(),
-                num_accepted_tokens_opt=new_num_accepted,
-                activation_mode=activation_num,
-                pad_slot_id=pad_slot_id,
-                run_mode=run_mode,
-            )
+            if op_backend == "310":
+                from vllm_ascend._310p.ops.fla.gdn_310 import npu_causal_conv1d_310_from_host
+
+                captured = npu_causal_conv1d_310_from_host(
+                    mixed_qkv,
+                    conv_weights_T,
+                    bias,
+                    conv_state,
+                    new_query_start_loc or None,
+                    new_cache_indices or None,
+                    None,
+                    new_num_accepted or None,
+                    activation_num,
+                    run_mode,
+                )
+                output.copy_(captured)
+            else:
+                torch.ops._C_ascend.npu_causal_conv1d_custom(
+                    output,
+                    mixed_qkv,
+                    conv_weights_T,
+                    conv_state=conv_state,
+                    bias_opt=bias,
+                    query_start_loc_opt=new_query_start_loc,
+                    cache_indices_opt=new_cache_indices,
+                    initial_state_mode_opt=(),
+                    num_accepted_tokens_opt=new_num_accepted,
+                    activation_mode=activation_num,
+                    pad_slot_id=pad_slot_id,
+                    run_mode=run_mode,
+                )
             torch.npu.graph_task_update_end(update_stream)
             event.record(update_stream)
 
