@@ -177,26 +177,28 @@ class NPUModelRunner310(NPUModelRunner):
         cascade_attn_prefix_lens=None,
         num_scheduled_tokens_compressed_list=None,
     ):
-        # Parent dummy_run assigns ChunkedPrefill to non-MLA MTP before metadata
-        # build. Hybrid GDN models need SpecDecoding + patched GDN host metadata
-        # so MTP verify can capture/replay npu_causal_conv1d_310 in graph mode.
-        capture_gdn_mtp = (
-            self._has_gdn
-            and self.speculative_config is not None
+        # FULL decode-only + MTP: parent dummy_run sets ChunkedPrefill for non-MLA
+        # models. 310P must use SpecDecoding so self-attn (splitfuse v2) and GDN
+        # (conv1d/recurrent) both capture/replay in FULL graph.
+        mtp_full_graph_metadata = (
+            self.speculative_config is not None
             and self.speculative_config.method == "mtp"
             and (for_cudagraph_capture or self.attn_state == AscendAttentionState.SpecDecoding)
         )
-        if capture_gdn_mtp:
+        if mtp_full_graph_metadata:
             self.attn_state = AscendAttentionState.SpecDecoding
-            use_spec_decode = True
+            use_spec_decode = self._has_gdn
             if for_cudagraph_capture:
                 num_reqs_for_draft = num_reqs_padded if num_reqs_padded is not None else num_reqs
                 num_spec = self.speculative_config.num_speculative_tokens
+                # Uniform decode graph shape: q_len = 1 + num_spec per request.
                 self.num_decode_draft_tokens.np[:num_reqs_for_draft] = num_spec
                 self.num_decode_draft_tokens.np[num_reqs_for_draft:].fill(-1)
                 self.num_decode_draft_tokens.copy_to_gpu()
-                self.num_accepted_tokens.np[:num_reqs_for_draft].fill(1)
+                self.num_accepted_tokens.np[:num_reqs_for_draft].fill(num_spec)
                 self.num_accepted_tokens.copy_to_gpu()
+            # build_for_graph_capture() hardcodes DecodeOnly; use build() so
+            # cm_base.attn_state=SpecDecoding flows into 310P/GDN metadata.
             for_cudagraph_capture = False
         return super()._build_attention_metadata(
             num_tokens=num_tokens,
@@ -604,12 +606,11 @@ class NPUModelRunner310(NPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
     ):
-        # Graph capture: avoid stale ChunkedPrefill forcing eager (NONE) while
-        # capture expects FULL. MTP verify uses SpecDecoding with q_len>1.
+        # FULL decode-only graph capture uses uniform q_len=1+num_spec and
+        # SpecDecoding (not parent ChunkedPrefill for non-MLA MTP).
         if (
             self.speculative_config is not None
             and self.speculative_config.method == "mtp"
-            and self._has_gdn
             and (is_graph_capturing or cudagraph_runtime_mode == CUDAGraphMode.FULL)
         ):
             self.attn_state = AscendAttentionState.SpecDecoding

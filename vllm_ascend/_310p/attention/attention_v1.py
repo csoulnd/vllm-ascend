@@ -120,12 +120,20 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         self.splitfuse_v2_available = cls._splitfuse_v2_available
 
     @staticmethod
-    def _query_lens_from_start_loc(query_start_loc: torch.Tensor) -> torch.Tensor:
-        """Per-request query lengths on the same device as ``query_start_loc``.
+    def _get_query_lens_cpu(attn_metadata) -> torch.Tensor:
+        query_lens_cpu = getattr(attn_metadata, "query_lens_cpu", None)
+        if query_lens_cpu is not None:
+            return query_lens_cpu
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
-        Avoids ``query_start_loc.cpu()`` which breaks ACL graph capture (D2H sync).
-        """
-        return query_start_loc[1:] - query_start_loc[:-1]
+        if _EXTRA_CTX.capturing:
+            raise RuntimeError(
+                "310P splitfuse requires attn_metadata.query_lens_cpu during graph capture; "
+                "ensure AscendAttentionMetadataBuilder310.build() ran before forward."
+            )
+        # Eager-only fallback.
+        qsl_cpu = attn_metadata.query_start_loc.cpu()
+        return qsl_cpu[1:] - qsl_cpu[:-1]
 
     def _forward_encoder_attention(
         self,
@@ -245,8 +253,8 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         query = query[:num_actual_tokens]
         output = output[:num_actual_tokens]
 
-        # Calculate query lengths from start locations (device-side for graph capture).
-        qlens = self._query_lens_from_start_loc(attn_metadata.query_start_loc)
+        # ATB splitfuse v1 expects host qLens; filled in metadata build (graph-safe).
+        qlens = self._get_query_lens_cpu(attn_metadata)
 
         block_table = attn_metadata.block_tables
 
@@ -290,9 +298,9 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
                 non_blocking=True,
             )
 
-        # Per-request query lengths: derived from device ``query_start_loc`` updated
-        # in-place during MTP / graph replay (no D2H sync during capture).
-        qlens = self._query_lens_from_start_loc(attn_metadata.query_start_loc)
+        # ATB splitfuse v2 requires host qLensTensor; use pinned CPU buffer from metadata
+        # (updated before forward / graph replay, no D2H sync during capture).
+        qlens = self._get_query_lens_cpu(attn_metadata)
 
         torch_npu._npu_paged_attention_splitfuse_v2(
             query=query,
