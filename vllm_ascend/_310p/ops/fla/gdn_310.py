@@ -25,11 +25,7 @@ from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import get_draft_graph_params, get_graph_params
-from vllm_ascend.ops.gdn import (
-    get_causal_conv1d_update_host_args,
-    get_non_spec_causal_conv1d_host_args,
-    get_spec_causal_conv1d_update_host_args,
-)
+from vllm_ascend.ops.gdn import get_non_spec_causal_conv1d_host_args
 from vllm_ascend.utils import enable_sp, vllm_version_is, weak_ref_tensors
 
 if vllm_version_is("0.20.2"):
@@ -55,16 +51,46 @@ def _copy_host_tuple_to_int64_buffer(
 ) -> None:
     if not host_tuple:
         return
-    buffer[: len(host_tuple)].copy_(
-        torch.tensor(host_tuple, dtype=torch.int64, device=buffer.device),
+    num_elements = len(host_tuple)
+    cpu_values = torch.tensor(host_tuple, dtype=torch.int64, device="cpu", pin_memory=buffer.is_pinned())
+    buffer[:num_elements].copy_(cpu_values, non_blocking=True)
+
+
+def _as_int64_device_view(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.int64:
+        return tensor
+    return tensor.to(torch.int64)
+
+
+def _get_spec_causal_conv1d_device_args(
+    attn_metadata: GDNAttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_spec_decodes = attn_metadata.num_spec_decodes
+    query_start_loc_buf = _as_int64_device_view(attn_metadata.spec_query_start_loc)
+    cache_indices_buf = _as_int64_device_view(attn_metadata.spec_state_indices_tensor[:, 0])
+    num_accepted_buf = _as_int64_device_view(attn_metadata.num_accepted_tokens)
+    return (
+        query_start_loc_buf[: num_spec_decodes + 1],
+        cache_indices_buf[:num_spec_decodes],
+        num_accepted_buf[:num_spec_decodes],
+        query_start_loc_buf,
+        cache_indices_buf,
+        num_accepted_buf,
     )
 
 
-def _make_conv1d_int64_buffer(
-    host_tuple: tuple[int, ...],
-    device: torch.device,
-) -> torch.Tensor:
-    return torch.tensor(host_tuple, dtype=torch.int64, device=device)
+def _get_non_spec_decode_causal_conv1d_device_args(
+    attn_metadata: GDNAttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_decodes = attn_metadata.num_decodes
+    query_start_loc_buf = _as_int64_device_view(attn_metadata.non_spec_query_start_loc)
+    cache_indices_buf = _as_int64_device_view(attn_metadata.non_spec_state_indices_tensor)
+    return (
+        query_start_loc_buf[: num_decodes + 1],
+        cache_indices_buf[: attn_metadata.num_actual_tokens],
+        query_start_loc_buf,
+        cache_indices_buf,
+    )
 
 
 def _register_310_conv1d_buffer_replay(
@@ -293,14 +319,10 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            spec_qsl_host, spec_ci_host, spec_nat_host = get_spec_causal_conv1d_update_host_args(attn_metadata)
-            device = mixed_qkv_spec.device
+            qsl_dev, cidx_dev, nat_dev, qsl_buf, cidx_buf, nat_buf = _get_spec_causal_conv1d_device_args(attn_metadata)
+            spec_q_per_seq = int(attn_metadata.spec_state_indices_tensor.size(-1))
             if _EXTRA_CTX.capturing:
                 graph_params = get_graph_params() if not _EXTRA_CTX.is_draft_model else get_draft_graph_params()
-                qsl_dev = _make_conv1d_int64_buffer(spec_qsl_host, device)
-                cidx_dev = _make_conv1d_int64_buffer(spec_ci_host, device)
-                nat_dev = _make_conv1d_int64_buffer(spec_nat_host, device)
-                spec_q_per_seq = int(attn_metadata.spec_state_indices_tensor.size(-1))
                 _register_310_conv1d_buffer_replay(
                     graph_params,
                     num_actual_tokens,
@@ -312,39 +334,24 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     run_mode=1,
                     branch="spec",
                     layer_prefix=self.prefix,
-                    qsl_dev=qsl_dev,
-                    cidx_dev=cidx_dev,
-                    nat_dev=nat_dev,
+                    qsl_dev=qsl_buf,
+                    cidx_dev=cidx_buf,
+                    nat_dev=nat_buf,
                     q_per_seq=spec_q_per_seq,
                 )
-                mixed_qkv_spec = npu_causal_conv1d_310_from_host(
-                    mixed_qkv_spec,
-                    conv_weights,
-                    self.conv1d.bias,
-                    conv_state,
-                    spec_qsl_host,
-                    spec_ci_host,
-                    None,
-                    spec_nat_host,
-                    activation_num,
-                    1,
-                    query_start_loc_dev=qsl_dev,
-                    cache_indices_dev=cidx_dev,
-                    num_accepted_tokens_dev=nat_dev,
-                )
-            else:
-                mixed_qkv_spec = npu_causal_conv1d_310_from_host(
-                    mixed_qkv_spec,
-                    conv_weights,
-                    self.conv1d.bias,
-                    conv_state,
-                    spec_qsl_host,
-                    spec_ci_host,
-                    None,
-                    spec_nat_host,
-                    activation_num,
-                    1,
-                )
+            mixed_qkv_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
+                mixed_qkv_spec,
+                conv_weights,
+                bias=self.conv1d.bias,
+                conv_states=conv_state,
+                query_start_loc=qsl_dev,
+                cache_indices=cidx_dev,
+                initial_state_mode=None,
+                num_accepted_tokens=nat_dev,
+                activation_mode=activation_num,
+                pad_slot_id=PAD_SLOT_ID,
+                run_mode=1,
+            )
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -365,12 +372,9 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     0,
                 )
         elif attn_metadata.num_decodes > 0:
-            non_spec_qsl_host, non_spec_ci_host = get_causal_conv1d_update_host_args(attn_metadata)
+            qsl_dev, cidx_dev, qsl_buf, cidx_buf = _get_non_spec_decode_causal_conv1d_device_args(attn_metadata)
             if _EXTRA_CTX.capturing:
                 graph_params = get_graph_params() if not _EXTRA_CTX.is_draft_model else get_draft_graph_params()
-                device = mixed_qkv_non_spec.device
-                qsl_dev = _make_conv1d_int64_buffer(non_spec_qsl_host, device)
-                cidx_dev = _make_conv1d_int64_buffer(non_spec_ci_host, device)
                 _register_310_conv1d_buffer_replay(
                     graph_params,
                     num_actual_tokens,
@@ -382,38 +386,24 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     run_mode=1,
                     branch="non_spec_decode",
                     layer_prefix=self.prefix,
-                    qsl_dev=qsl_dev,
-                    cidx_dev=cidx_dev,
+                    qsl_dev=qsl_buf,
+                    cidx_dev=cidx_buf,
                     nat_dev=None,
                     q_per_seq=1,
                 )
-                mixed_qkv_non_spec = npu_causal_conv1d_310_from_host(
-                    mixed_qkv_non_spec,
-                    conv_weights,
-                    self.conv1d.bias,
-                    conv_state,
-                    non_spec_qsl_host,
-                    non_spec_ci_host,
-                    None,
-                    None,
-                    activation_num,
-                    1,
-                    query_start_loc_dev=qsl_dev,
-                    cache_indices_dev=cidx_dev,
-                )
-            else:
-                mixed_qkv_non_spec = npu_causal_conv1d_310_from_host(
-                    mixed_qkv_non_spec,
-                    conv_weights,
-                    self.conv1d.bias,
-                    conv_state,
-                    non_spec_qsl_host,
-                    non_spec_ci_host,
-                    None,
-                    None,
-                    activation_num,
-                    1,
-                )
+            mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
+                mixed_qkv_non_spec,
+                conv_weights,
+                bias=self.conv1d.bias,
+                conv_states=conv_state,
+                query_start_loc=qsl_dev,
+                cache_indices=cidx_dev,
+                initial_state_mode=None,
+                num_accepted_tokens=None,
+                activation_mode=activation_num,
+                pad_slot_id=PAD_SLOT_ID,
+                run_mode=1,
+            )
         else:
             mixed_qkv_non_spec = None
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
