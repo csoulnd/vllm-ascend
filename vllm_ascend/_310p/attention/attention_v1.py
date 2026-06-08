@@ -28,7 +28,6 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm_ascend._310p.attention.attention_mask import (
     MASK_TYPE_NORM_COMPRESS,
     AttentionMaskBuilder310,
-    get_attn_mask_builder_310,
 )
 from vllm_ascend._310p.attention.metadata_builder import AscendAttentionMetadataBuilder310
 from vllm_ascend.attention.attention_v1 import (
@@ -242,14 +241,16 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         qsl_cpu = attn_metadata.query_start_loc.cpu()
         qlens = qsl_cpu[1:] - qsl_cpu[:-1]
 
-        context_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_tables
 
         # Generate the specific mask for splitfuse
         mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device)
 
-        if context_lens.device != query.device:
-            context_lens = context_lens.to(query.device, non_blocking=True)
+        if attn_metadata.seq_lens.device != query.device:
+            attn_metadata.seq_lens = attn_metadata.seq_lens.to(
+                device=query.device,
+                non_blocking=True,
+            )
 
         torch_npu._npu_paged_attention_splitfuse(
             query=query,
@@ -258,7 +259,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             mask=mask,
             block_table=block_table,
             seq_len=qlens,
-            context_lens=context_lens,
+            context_lens=attn_metadata.seq_lens,
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             scale_value=self.scale,
@@ -276,24 +277,24 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         query = query[:num_actual_tokens]
         output = output[:num_actual_tokens]
 
+        if attn_metadata.seq_lens.device != query.device:
+            attn_metadata.seq_lens = attn_metadata.seq_lens.to(
+                device=query.device,
+                non_blocking=True,
+            )
+
+        # Per-request query lengths: derived from query_start_loc which is
+        # updated in-place during MTP / graph replay (same as splitfuse v1).
         qsl_cpu = attn_metadata.query_start_loc.cpu()
         qlens = qsl_cpu[1:] - qsl_cpu[:-1]
 
-        context_lens = attn_metadata.seq_lens
-        block_table = attn_metadata.block_tables
-
-        if context_lens.device != query.device:
-            context_lens = context_lens.to(query.device, non_blocking=True)
-
-        mask_builder = get_attn_mask_builder_310(query.device, AttentionMaskBuilder310.max_seqlen)
-        mask = mask_builder.get_splitfuse_v2_causal_mask()
         torch_npu._npu_paged_attention_splitfuse_v2(
             query=query,
             key_cache=self.key_cache,
             value_cache=self.value_cache,
-            block_table=block_table,
-            context_lens=context_lens,
-            mask=mask,
+            block_table=attn_metadata.block_tables,
+            context_lens=attn_metadata.seq_lens,
+            mask=attn_metadata.attn_mask,
             seq_len=qlens,
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,

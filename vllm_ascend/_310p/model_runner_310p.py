@@ -161,6 +161,46 @@ class NPUModelRunner310(NPUModelRunner):
             num_encoder_reqs=num_encoder_reqs,
         )
 
+    def _build_attention_metadata(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        max_query_len: int,
+        num_tokens_padded: int | None = None,
+        num_reqs_padded: int | None = None,
+        ubatch_slices=None,
+        logits_indices=None,
+        use_spec_decode: bool = False,
+        for_cudagraph_capture: bool = False,
+        num_scheduled_tokens=None,
+        num_scheduled_tokens_np=None,
+        cascade_attn_prefix_lens=None,
+        num_scheduled_tokens_compressed_list=None,
+    ):
+        # Parent dummy_run assigns ChunkedPrefill to non-MLA MTP; 310P MTP verify
+        # uses splitfuse v2 under SpecDecoding and must capture the same path.
+        if (
+            for_cudagraph_capture
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+        ):
+            self.attn_state = AscendAttentionState.SpecDecoding
+        return super()._build_attention_metadata(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            max_query_len=max_query_len,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs_padded=num_reqs_padded,
+            ubatch_slices=ubatch_slices,
+            logits_indices=logits_indices,
+            use_spec_decode=use_spec_decode,
+            for_cudagraph_capture=for_cudagraph_capture,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+            num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
+        )
+
     def _pad_query_start_loc_for_fia(
         self,
         num_tokens_padded: int,
