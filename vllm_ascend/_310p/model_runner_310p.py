@@ -591,6 +591,18 @@ class NPUModelRunner310(NPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
     ):
+        # Parent dummy_run sets ChunkedPrefill for non-MLA MTP *after*
+        # _determine_batch_execution_and_padding. If a prior dummy_run left
+        # ChunkedPrefill on self.attn_state, 310P would force eager (NONE)
+        # while capture expects FULL. Set SpecDecoding before super() so
+        # determine/metadata both match the splitfuse v2 capture path.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and (is_graph_capturing or cudagraph_runtime_mode == CUDAGraphMode.FULL)
+        ):
+            self.attn_state = AscendAttentionState.SpecDecoding
+
         temporary_context = self.temporary_modify_uniform_decode_query_len() if uniform_decode else nullcontext()
         with temporary_context:
             return super()._dummy_run(
