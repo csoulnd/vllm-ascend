@@ -146,15 +146,24 @@ def _flatten_state_indices(
     if ssm_state_indices.ndim == 1:
         return ssm_state_indices[:total_tokens].to(torch.int32).contiguous()
 
-    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    ssm_state_indices = ssm_state_indices[: seq_lens.shape[0]]
-    positions = torch.arange(
-        ssm_state_indices.shape[1],
-        device=ssm_state_indices.device,
-        dtype=seq_lens.dtype,
-    )
+    # masked_select on NPU triggers stream sync and breaks ACL graph capture.
+    # Compact 2D indices on CPU, then copy back asynchronously.
+    num_seqs = (cu_seqlens[1:] - cu_seqlens[:-1]).shape[0]
+    ssm_cpu = ssm_state_indices[:num_seqs].cpu()
+    seq_lens = cu_seqlens[1 : num_seqs + 1].cpu() - cu_seqlens[:num_seqs].cpu()
+    q_per_seq = ssm_cpu.shape[1]
+    positions = torch.arange(q_per_seq)
     valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
-    return ssm_state_indices.masked_select(valid)[:total_tokens].to(torch.int32).contiguous()
+    flat_cpu = ssm_cpu.masked_select(valid).to(torch.int32).contiguous()[:total_tokens]
+    if not flat_cpu.is_pinned:
+        flat_cpu = flat_cpu.pin_memory()
+    flat_dev = torch.empty(
+        flat_cpu.numel(),
+        dtype=torch.int32,
+        device=ssm_state_indices.device,
+    )
+    flat_dev.copy_(flat_cpu, non_blocking=True)
+    return flat_dev.contiguous()
 
 
 def _host_tuple_to_int64_tensor(
@@ -220,13 +229,17 @@ def npu_recurrent_gated_delta_rule_310(
     ssm_state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    flat_ssm_state_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if use_qk_l2norm_in_kernel:
         q = _l2norm(q)
         k = _l2norm(k)
 
     total_tokens = v.shape[1]
-    flat_state_indices = _flatten_state_indices(ssm_state_indices, cu_seqlens, total_tokens)
+    if flat_ssm_state_indices is not None:
+        flat_state_indices = flat_ssm_state_indices[:total_tokens].to(torch.int32).contiguous()
+    else:
+        flat_state_indices = _flatten_state_indices(ssm_state_indices, cu_seqlens, total_tokens)
     actual_seq_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32).contiguous()
     accepted_tokens = None
     if num_accepted_tokens is not None:
@@ -432,6 +445,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
 
             # 2.1: Process the multi-query part
             if spec_sequence_masks is not None:
+                spec_flat_ssm_state_indices = getattr(attn_metadata, "spec_flat_ssm_state_indices", None)
                 core_attn_out_spec = npu_recurrent_gated_delta_rule_310(
                     q=query_spec,
                     k=key_spec,
@@ -443,6 +457,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
+                    flat_ssm_state_indices=spec_flat_ssm_state_indices,
                 )
             else:
                 core_attn_out_spec = None

@@ -101,6 +101,28 @@ class _GDNSpecCausalConv1dHostBufferSlot:
 
 
 @dataclass
+class _GDNSpecFlatSsmStateIndicesBufferSlot:
+    flat_ssm_state_indices: torch.Tensor
+
+
+def _flatten_spec_ssm_state_indices_cpu(
+    spec_state_indices_tensor: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    num_spec_decodes: int,
+) -> torch.Tensor:
+    ssm_cpu = spec_state_indices_tensor[:num_spec_decodes].cpu()
+    if ssm_cpu.ndim == 1:
+        return ssm_cpu.to(torch.int32).contiguous()
+
+    cu_cpu = spec_query_start_loc[: num_spec_decodes + 1].cpu()
+    seq_lens = cu_cpu[1:] - cu_cpu[:-1]
+    q_per_seq = ssm_cpu.shape[1]
+    positions = torch.arange(q_per_seq)
+    valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+    return ssm_cpu.masked_select(valid).to(torch.int32).contiguous()
+
+
+@dataclass
 class _GDNChunkMetaSizeInfo:
     num_seqs: int
     num_chunk_indices_chunk64: int
@@ -561,6 +583,72 @@ def _acquire_spec_causal_conv1d_host_slot(builder) -> _GDNSpecCausalConv1dHostBu
     return pool[builder._ascend_gdn_spec_causal_conv1d_host_pool_idx]
 
 
+def _allocate_spec_flat_ssm_state_indices_slot(
+    builder,
+    device: torch.device,
+) -> _GDNSpecFlatSsmStateIndicesBufferSlot:
+    max_num_seqs = builder.vllm_config.scheduler_config.max_num_seqs
+    spec_cfg = builder.vllm_config.speculative_config
+    num_speculative_tokens = spec_cfg.num_speculative_tokens if spec_cfg else 0
+    decode_cudagraph_max_bs = getattr(builder, "decode_cudagraph_max_bs", max_num_seqs)
+    max_elements = decode_cudagraph_max_bs * (num_speculative_tokens + 1)
+    return _GDNSpecFlatSsmStateIndicesBufferSlot(
+        flat_ssm_state_indices=torch.empty(
+            max_elements,
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+
+
+def _ensure_spec_flat_ssm_state_indices_state(builder, device: torch.device) -> None:
+    if getattr(builder, "_ascend_gdn_spec_flat_ssm_state_indices_initialized", False):
+        return
+    builder._ascend_gdn_spec_flat_ssm_state_indices_initialized = True
+    builder._ascend_gdn_spec_flat_ssm_state_indices_pool_idx = -1
+    builder._ascend_gdn_spec_flat_ssm_state_indices_pool = []
+    if device.type != "cpu":
+        builder._ascend_gdn_spec_flat_ssm_state_indices_pool = [
+            _allocate_spec_flat_ssm_state_indices_slot(builder, device),
+            _allocate_spec_flat_ssm_state_indices_slot(builder, device),
+        ]
+
+
+def _acquire_spec_flat_ssm_state_indices_slot(
+    builder,
+) -> _GDNSpecFlatSsmStateIndicesBufferSlot:
+    pool = builder._ascend_gdn_spec_flat_ssm_state_indices_pool
+    builder._ascend_gdn_spec_flat_ssm_state_indices_pool_idx = (
+        builder._ascend_gdn_spec_flat_ssm_state_indices_pool_idx + 1
+    ) % len(pool)
+    return pool[builder._ascend_gdn_spec_flat_ssm_state_indices_pool_idx]
+
+
+def _fill_spec_flat_ssm_state_indices(
+    builder,
+    attn_metadata: gdn_attn.GDNAttentionMetadata,
+) -> None:
+    if attn_metadata.spec_state_indices_tensor is None or attn_metadata.spec_query_start_loc is None:
+        attn_metadata.spec_flat_ssm_state_indices = None
+        return
+
+    flat_cpu = _flatten_spec_ssm_state_indices_cpu(
+        attn_metadata.spec_state_indices_tensor,
+        attn_metadata.spec_query_start_loc,
+        attn_metadata.num_spec_decodes,
+    )
+    if attn_metadata.spec_state_indices_tensor.device.type == "cpu":
+        attn_metadata.spec_flat_ssm_state_indices = flat_cpu
+        return
+
+    slot = _acquire_spec_flat_ssm_state_indices_slot(builder)
+    num_elements = flat_cpu.numel()
+    if not flat_cpu.is_pinned:
+        flat_cpu = flat_cpu.pin_memory()
+    slot.flat_ssm_state_indices[:num_elements].copy_(flat_cpu, non_blocking=True)
+    attn_metadata.spec_flat_ssm_state_indices = slot.flat_ssm_state_indices
+
+
 def _copy_to_pinned_cpu(
     tensor: torch.Tensor,
     pinned_buffer: torch.Tensor | None,
@@ -828,6 +916,11 @@ def _patched_build_spec(
             spec_query_start_loc_cpu,
         ),
     )
+    _ensure_spec_flat_ssm_state_indices_state(
+        self,
+        common_attn_metadata.query_start_loc.device,
+    )
+    _fill_spec_flat_ssm_state_indices(self, attn_metadata)
     return attn_metadata
 
 
