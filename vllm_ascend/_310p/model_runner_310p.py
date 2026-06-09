@@ -193,24 +193,38 @@ class NPUModelRunner310(NPUModelRunner):
         cascade_attn_prefix_lens=None,
         num_scheduled_tokens_compressed_list=None,
     ):
-        # FULL decode-only + MTP: parent dummy_run sets ChunkedPrefill for non-MLA
-        # models. 310P must use SpecDecoding so self-attn (splitfuse v2) and GDN
-        # (conv1d/recurrent) both capture/replay in FULL graph.
-        mtp_full_graph_metadata = (
+        # MTP + GDN: post#0 (accepted-only, 1 token) and verify (2 tokens) must
+        # both use the GDN spec conv1d/recurrent path. Eager post#0 does not
+        # schedule draft tokens, so num_decode_draft_tokens stays -1 and upstream
+        # GDN build falls back to decode ops — verify then disagrees with the
+        # hidden that produced the draft (target=25 vs draft=8340).
+        mtp_gdn_metadata = (
             self.speculative_config is not None
             and self.speculative_config.method == "mtp"
-            and (for_cudagraph_capture or self.attn_state == AscendAttentionState.SpecDecoding)
+            and self._has_gdn
         )
-        if mtp_full_graph_metadata:
+        if mtp_gdn_metadata:
             self.attn_state = AscendAttentionState.SpecDecoding
-            use_spec_decode = self._has_gdn
+            use_spec_decode = True
+            num_reqs_for_draft = num_reqs_padded if num_reqs_padded is not None else num_reqs
+            num_spec = self.speculative_config.num_speculative_tokens
             if for_cudagraph_capture:
-                num_reqs_for_draft = num_reqs_padded if num_reqs_padded is not None else num_reqs
-                num_spec = self.speculative_config.num_speculative_tokens
                 # Uniform decode graph shape: q_len = 1 + num_spec per request.
                 self.num_decode_draft_tokens.np[:num_reqs_for_draft] = num_spec
                 self.num_decode_draft_tokens.np[num_reqs_for_draft:].fill(-1)
-                self.num_decode_draft_tokens.copy_to_gpu()
+                self.num_accepted_tokens.np[:num_reqs_for_draft].fill(num_spec)
+            elif not (self.num_decode_draft_tokens.np[:num_reqs] >= 0).any():
+                # post#0 accepted-only decode: tag decode reqs with num_spec so
+                # upstream GDN enables spec_sequence_masks (sum must be > 0).
+                for req_idx in range(num_reqs):
+                    if (
+                        self.input_batch.num_computed_tokens_cpu[req_idx]
+                        >= self.input_batch.num_prompt_tokens[req_idx]
+                    ):
+                        self.num_decode_draft_tokens.np[req_idx] = num_spec
+                self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+            self.num_decode_draft_tokens.copy_to_gpu()
+            if for_cudagraph_capture:
                 self.num_accepted_tokens.np[:num_reqs_for_draft].fill(num_spec)
                 self.num_accepted_tokens.copy_to_gpu()
             # build_for_graph_capture() hardcodes DecodeOnly; use build() so

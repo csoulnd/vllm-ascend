@@ -306,6 +306,20 @@ def test_non_spec_prefill_fallback_meta_matches_original_inputs_and_runtime_help
     )
 
 
+def test_build_spec_sequence_masks_cpu_allows_zero_draft_count():
+    builder = SimpleNamespace(use_spec_decode=True)
+    draft_cpu = torch.tensor([-1, 0, 1], dtype=torch.int32)
+    masks = patch_gdn_attn._build_spec_sequence_masks_cpu(builder, draft_cpu)
+    assert masks is not None
+    assert masks.tolist() == [False, True, True]
+
+
+def test_build_spec_sequence_masks_cpu_returns_none_when_all_prefill():
+    builder = SimpleNamespace(use_spec_decode=True)
+    draft_cpu = torch.tensor([-1, -1], dtype=torch.int32)
+    assert patch_gdn_attn._build_spec_sequence_masks_cpu(builder, draft_cpu) is None
+
+
 def test_build_non_spec_causal_conv1d_host_meta_avoids_seq_lens_cpu_fallback():
     class GuardSeqLens:
         def to(self, *args, **kwargs):

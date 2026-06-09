@@ -476,13 +476,12 @@ def _ensure_chunk_meta_state(builder, device: torch.device) -> None:
 
 
 def _build_spec_sequence_masks_cpu(builder, num_decode_draft_tokens_cpu: torch.Tensor | None) -> torch.Tensor | None:
-    if (
-        not getattr(builder, "use_spec_decode", False)
-        or num_decode_draft_tokens_cpu is None
-        or num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0].sum().item() == 0
-    ):
+    if not getattr(builder, "use_spec_decode", False) or num_decode_draft_tokens_cpu is None:
         return None
-    return num_decode_draft_tokens_cpu >= 0
+    spec_mask = num_decode_draft_tokens_cpu >= 0
+    if not spec_mask.any().item():
+        return None
+    return spec_mask
 
 
 def _build_non_spec_query_start_loc_cpu(
