@@ -239,10 +239,13 @@ def _patch_missing_runtime_cdiv(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _expected_conv1d_host_args(attn_metadata) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    fallback_meta = attn_metadata.non_spec_prefill_fallback_meta
+    causal_conv1d = fallback_meta.causal_conv1d
+    num_seqs = causal_conv1d.query_start_loc_cpu.numel() - 1
     return (
-        to_int64_tuple(attn_metadata.non_spec_query_start_loc),
-        to_int64_tuple(attn_metadata.non_spec_state_indices_tensor),
-        to_int64_tuple(attn_metadata.has_initial_state),
+        to_int64_tuple(causal_conv1d.query_start_loc_cpu),
+        to_int64_tuple(causal_conv1d.cache_indices_cpu[:num_seqs]),
+        to_int64_tuple(causal_conv1d.has_initial_state_cpu[:num_seqs]),
     )
 
 
@@ -322,6 +325,11 @@ def test_build_non_spec_causal_conv1d_host_meta_avoids_seq_lens_cpu_fallback():
         builder,
         attn_metadata,
         non_spec_query_start_loc_cpu=torch.tensor([0, 4, 12], dtype=torch.int32),
+        common_attn_metadata=SimpleNamespace(
+            query_start_loc=torch.tensor([0, 4, 12], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 4, 12], dtype=torch.int32),
+        ),
+        num_decode_draft_tokens_cpu=None,
     )
 
     assert host_meta is not None
@@ -329,6 +337,39 @@ def test_build_non_spec_causal_conv1d_host_meta_avoids_seq_lens_cpu_fallback():
         host_meta.has_initial_state_cpu,
         torch.tensor([True, False]),
     )
+
+
+def test_extract_non_spec_seq_cache_indices_filters_spec_sequences():
+    common_qsl = torch.tensor([0, 73, 75], dtype=torch.int32)
+    # Per-token cache indices: prefill seq uses slot 5, spec seq uses slot 9.
+    per_token_indices = torch.tensor([5] * 73 + [9, 9], dtype=torch.int32)
+    spec_masks = torch.tensor([False, True])
+
+    filtered = patch_gdn_attn._extract_non_spec_seq_cache_indices_cpu(
+        per_token_indices,
+        common_qsl,
+        spec_masks,
+    )
+    assert torch.equal(filtered, torch.tensor([5], dtype=torch.int32))
+
+    per_seq_indices = torch.tensor([5, 9], dtype=torch.int32)
+    filtered_per_seq = patch_gdn_attn._extract_non_spec_seq_cache_indices_cpu(
+        per_seq_indices,
+        common_qsl,
+        spec_masks,
+    )
+    assert torch.equal(filtered_per_seq, torch.tensor([5], dtype=torch.int32))
+
+
+def test_extract_non_spec_seq_has_initial_state_filters_spec_sequences():
+    has_initial_state = torch.tensor([True, False])
+    spec_masks = torch.tensor([False, True])
+
+    filtered = patch_gdn_attn._extract_non_spec_seq_has_initial_state_cpu(
+        has_initial_state,
+        spec_masks,
+    )
+    assert torch.equal(filtered, torch.tensor([True]))
 
 
 def test_build_non_spec_causal_conv1d_host_meta_requires_has_initial_state():
@@ -343,6 +384,11 @@ def test_build_non_spec_causal_conv1d_host_meta_requires_has_initial_state():
             builder,
             attn_metadata,
             non_spec_query_start_loc_cpu=torch.tensor([0, 4, 12], dtype=torch.int32),
+            common_attn_metadata=SimpleNamespace(
+                query_start_loc=torch.tensor([0, 4, 12], dtype=torch.int32),
+                query_start_loc_cpu=torch.tensor([0, 4, 12], dtype=torch.int32),
+            ),
+            num_decode_draft_tokens_cpu=None,
         )
 
 

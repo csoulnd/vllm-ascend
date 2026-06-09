@@ -92,6 +92,9 @@ class _GDNChunkedPrefillBufferSlot:
 class _GDNCausalConv1dHostBufferSlot:
     cache_indices_cpu: torch.Tensor
     has_initial_state_cpu: torch.Tensor
+    query_start_loc_dev: torch.Tensor | None = None
+    cache_indices_dev: torch.Tensor | None = None
+    has_initial_state_dev: torch.Tensor | None = None
 
 
 @dataclass
@@ -502,6 +505,25 @@ def _allocate_causal_conv1d_host_slot(
     device: torch.device,
 ) -> _GDNCausalConv1dHostBufferSlot:
     max_num_seqs = builder.vllm_config.scheduler_config.max_num_seqs
+    query_start_loc_dev = None
+    cache_indices_dev = None
+    has_initial_state_dev = None
+    if device.type != "cpu":
+        query_start_loc_dev = torch.empty(
+            max_num_seqs + 1,
+            dtype=torch.int64,
+            device=device,
+        )
+        cache_indices_dev = torch.empty(
+            max_num_seqs,
+            dtype=torch.int64,
+            device=device,
+        )
+        has_initial_state_dev = torch.empty(
+            max_num_seqs,
+            dtype=torch.int64,
+            device=device,
+        )
     return _GDNCausalConv1dHostBufferSlot(
         cache_indices_cpu=torch.empty(
             max_num_seqs,
@@ -515,6 +537,9 @@ def _allocate_causal_conv1d_host_slot(
             device="cpu",
             pin_memory=device.type != "cpu",
         ),
+        query_start_loc_dev=query_start_loc_dev,
+        cache_indices_dev=cache_indices_dev,
+        has_initial_state_dev=has_initial_state_dev,
     )
 
 
@@ -673,10 +698,79 @@ def _copy_to_pinned_cpu(
     return cpu_tensor
 
 
+def _extract_non_spec_seq_cache_indices_cpu(
+    non_spec_state_indices_tensor: torch.Tensor,
+    common_query_start_loc_cpu: torch.Tensor,
+    spec_sequence_masks_cpu: torch.Tensor | None,
+) -> torch.Tensor:
+    flat_cpu = (
+        non_spec_state_indices_tensor.reshape(-1).cpu()
+        if non_spec_state_indices_tensor.device.type != "cpu"
+        else non_spec_state_indices_tensor.reshape(-1)
+    )
+    num_seqs = common_query_start_loc_cpu.numel() - 1
+    if flat_cpu.numel() == num_seqs:
+        if spec_sequence_masks_cpu is None:
+            return flat_cpu
+        return flat_cpu[~spec_sequence_masks_cpu]
+
+    if spec_sequence_masks_cpu is None:
+        seq_starts = common_query_start_loc_cpu[:-1].to(torch.long)
+        return flat_cpu[seq_starts]
+
+    non_spec_seq_starts = common_query_start_loc_cpu[:-1][~spec_sequence_masks_cpu].to(torch.long)
+    return flat_cpu[non_spec_seq_starts]
+
+
+def _extract_non_spec_seq_has_initial_state_cpu(
+    has_initial_state: torch.Tensor,
+    spec_sequence_masks_cpu: torch.Tensor | None,
+) -> torch.Tensor:
+    cpu_tensor = has_initial_state.reshape(-1)
+    if cpu_tensor.device.type != "cpu":
+        cpu_tensor = cpu_tensor.cpu()
+    if spec_sequence_masks_cpu is None:
+        return cpu_tensor
+    return cpu_tensor[~spec_sequence_masks_cpu]
+
+
+def _copy_cpu_int64_tuple_to_device_buffer(
+    buffer: torch.Tensor,
+    host_tuple: tuple[int, ...],
+) -> None:
+    if not host_tuple:
+        return
+    cpu_values = torch.tensor(host_tuple, dtype=torch.int64, device="cpu", pin_memory=buffer.is_pinned())
+    buffer[: len(host_tuple)].copy_(cpu_values, non_blocking=True)
+
+
+def _fill_non_spec_prefill_conv1d_device_bufs(
+    slot: _GDNCausalConv1dHostBufferSlot,
+    causal_conv1d_meta: GDNCausalConv1dHostMetadata,
+) -> None:
+    if slot.query_start_loc_dev is None or slot.cache_indices_dev is None or slot.has_initial_state_dev is None:
+        return
+    num_seqs = causal_conv1d_meta.query_start_loc_cpu.numel() - 1
+    _copy_cpu_int64_tuple_to_device_buffer(
+        slot.query_start_loc_dev,
+        tuple(causal_conv1d_meta.query_start_loc_cpu.to(torch.int64).tolist()),
+    )
+    _copy_cpu_int64_tuple_to_device_buffer(
+        slot.cache_indices_dev,
+        tuple(causal_conv1d_meta.cache_indices_cpu[:num_seqs].to(torch.int64).tolist()),
+    )
+    _copy_cpu_int64_tuple_to_device_buffer(
+        slot.has_initial_state_dev,
+        tuple(causal_conv1d_meta.has_initial_state_cpu[:num_seqs].to(torch.int64).tolist()),
+    )
+
+
 def _build_non_spec_causal_conv1d_host_meta(
     builder,
     attn_metadata,
     non_spec_query_start_loc_cpu: torch.Tensor,
+    common_attn_metadata,
+    num_decode_draft_tokens_cpu: torch.Tensor | None,
 ) -> GDNCausalConv1dHostMetadata:
     assert attn_metadata.num_prefills > 0
     if attn_metadata.non_spec_state_indices_tensor is None:
@@ -686,28 +780,44 @@ def _build_non_spec_causal_conv1d_host_meta(
     if attn_metadata.has_initial_state is None:
         raise RuntimeError("Expected attn_metadata.has_initial_state for patched GDN non-spec prefill path.")
 
+    spec_sequence_masks_cpu = _build_spec_sequence_masks_cpu(builder, num_decode_draft_tokens_cpu)
+    common_query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+    cache_indices_filtered = _extract_non_spec_seq_cache_indices_cpu(
+        attn_metadata.non_spec_state_indices_tensor,
+        common_query_start_loc_cpu,
+        spec_sequence_masks_cpu,
+    )
+    has_initial_state_filtered = _extract_non_spec_seq_has_initial_state_cpu(
+        attn_metadata.has_initial_state,
+        spec_sequence_masks_cpu,
+    )
+
     slot = None
     if (
-        attn_metadata.non_spec_state_indices_tensor.device.type != "cpu"
-        or attn_metadata.has_initial_state.device.type != "cpu"
+        common_attn_metadata.query_start_loc.device.type != "cpu"
+        or attn_metadata.non_spec_state_indices_tensor.device.type != "cpu"
     ):
         slot = _acquire_causal_conv1d_host_slot(builder)
 
+    num_seqs = non_spec_query_start_loc_cpu.numel() - 1
     cache_indices_cpu = _copy_to_pinned_cpu(
-        attn_metadata.non_spec_state_indices_tensor,
-        None if slot is None else slot.cache_indices_cpu,
+        cache_indices_filtered,
+        None if slot is None else slot.cache_indices_cpu[:num_seqs],
     )
     has_initial_state_cpu = _copy_to_pinned_cpu(
-        attn_metadata.has_initial_state,
-        None if slot is None else slot.has_initial_state_cpu,
+        has_initial_state_filtered,
+        None if slot is None else slot.has_initial_state_cpu[:num_seqs],
     )
 
-    return GDNCausalConv1dHostMetadata(
+    causal_conv1d_meta = GDNCausalConv1dHostMetadata(
         query_start_loc_cpu=non_spec_query_start_loc_cpu,
         cache_indices_cpu=cache_indices_cpu,
         has_initial_state_cpu=has_initial_state_cpu,
         _buffer_slot=slot,
     )
+    if slot is not None:
+        _fill_non_spec_prefill_conv1d_device_bufs(slot, causal_conv1d_meta)
+    return causal_conv1d_meta
 
 
 def _build_non_spec_decode_causal_conv1d_host_meta(
@@ -831,37 +941,18 @@ def _patched_build(
     return attn_metadata
 
 
-def _sync_non_spec_prefill_device_tensors(
+def _sync_non_spec_prefill_query_start_loc(
     attn_metadata: gdn_attn.GDNAttentionMetadata,
     non_spec_query_start_loc_cpu: torch.Tensor,
-    causal_conv1d_meta: GDNCausalConv1dHostMetadata,
 ) -> None:
     non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-    if non_spec_query_start_loc.device.type == "cpu":
+    if non_spec_query_start_loc is None or non_spec_query_start_loc.device.type == "cpu":
         return
 
     num_qsl = non_spec_query_start_loc_cpu.numel()
     non_spec_query_start_loc[:num_qsl].copy_(
         non_spec_query_start_loc_cpu.to(
             device=non_spec_query_start_loc.device,
-            non_blocking=True,
-        )
-    )
-
-    non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
-    num_ci = causal_conv1d_meta.cache_indices_cpu.numel()
-    non_spec_state_indices_tensor[:num_ci].copy_(
-        causal_conv1d_meta.cache_indices_cpu.to(
-            device=non_spec_state_indices_tensor.device,
-            non_blocking=True,
-        )
-    )
-
-    has_initial_state = attn_metadata.has_initial_state
-    num_ism = causal_conv1d_meta.has_initial_state_cpu.numel()
-    has_initial_state[:num_ism].copy_(
-        causal_conv1d_meta.has_initial_state_cpu.to(
-            device=has_initial_state.device,
             non_blocking=True,
         )
     )
@@ -892,11 +983,12 @@ def _patched_build_prefill(
         self,
         attn_metadata,
         non_spec_query_start_loc_cpu,
+        common_attn_metadata,
+        num_decode_draft_tokens_cpu,
     )
-    _sync_non_spec_prefill_device_tensors(
+    _sync_non_spec_prefill_query_start_loc(
         attn_metadata,
         non_spec_query_start_loc_cpu,
-        causal_conv1d_meta,
     )
     attn_metadata.non_spec_prefill_fallback_meta = GDNPrefillFallbackMeta(
         causal_conv1d=causal_conv1d_meta,

@@ -96,22 +96,33 @@ def _get_non_spec_prefill_causal_conv1d_device_args(
     attn_metadata: GDNAttentionMetadata,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     fallback_meta = getattr(attn_metadata, "non_spec_prefill_fallback_meta", None)
-    if fallback_meta is not None:
-        num_non_spec_seqs = fallback_meta.causal_conv1d.query_start_loc_cpu.numel() - 1
-    else:
-        num_non_spec_seqs = attn_metadata.num_prefills
+    if fallback_meta is None:
+        raise RuntimeError(
+            "Expected attn_metadata.non_spec_prefill_fallback_meta for prefill causal conv1d on 310P."
+        )
 
-    query_start_loc_buf = _as_int64_device_view(attn_metadata.non_spec_query_start_loc)
-    cache_indices_buf = _as_int64_device_view(attn_metadata.non_spec_state_indices_tensor)
-    initial_state_mode_buf = _as_int64_device_view(attn_metadata.has_initial_state)
-    return (
-        query_start_loc_buf[: num_non_spec_seqs + 1],
-        cache_indices_buf[:num_non_spec_seqs],
-        initial_state_mode_buf[:num_non_spec_seqs],
-        query_start_loc_buf,
-        cache_indices_buf,
-        initial_state_mode_buf,
-    )
+    causal_conv1d = fallback_meta.causal_conv1d
+    num_non_spec_seqs = causal_conv1d.query_start_loc_cpu.numel() - 1
+    slot = causal_conv1d._buffer_slot
+    if (
+        slot is not None
+        and slot.query_start_loc_dev is not None
+        and slot.cache_indices_dev is not None
+        and slot.has_initial_state_dev is not None
+    ):
+        return (
+            slot.query_start_loc_dev[: num_non_spec_seqs + 1],
+            slot.cache_indices_dev[:num_non_spec_seqs],
+            slot.has_initial_state_dev[:num_non_spec_seqs],
+            slot.query_start_loc_dev,
+            slot.cache_indices_dev,
+            slot.has_initial_state_dev,
+        )
+
+    qsl = causal_conv1d.query_start_loc_cpu.to(torch.int64)
+    cidx = causal_conv1d.cache_indices_cpu[:num_non_spec_seqs].to(torch.int64)
+    ism = causal_conv1d.has_initial_state_cpu[:num_non_spec_seqs].to(torch.int64)
+    return (qsl, cidx, ism, qsl, cidx, ism)
 
 
 def _register_310_conv1d_buffer_replay(
@@ -529,16 +540,34 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
             if attn_metadata.num_prefills > 0:
                 fallback_meta = getattr(attn_metadata, "non_spec_prefill_fallback_meta", None)
                 if fallback_meta is not None:
-                    num_non_spec_seqs = fallback_meta.causal_conv1d.query_start_loc_cpu.numel() - 1
+                    causal_conv1d = fallback_meta.causal_conv1d
+                    num_non_spec_seqs = causal_conv1d.query_start_loc_cpu.numel() - 1
+                    slot = causal_conv1d._buffer_slot
+                    if slot is not None and slot.cache_indices_dev is not None:
+                        state_indices = slot.cache_indices_dev[:num_non_spec_seqs]
+                        has_initial_state_seq = slot.has_initial_state_dev[:num_non_spec_seqs].bool()
+                        cu_seqlens = slot.query_start_loc_dev[: num_non_spec_seqs + 1]
+                    else:
+                        state_indices = causal_conv1d.cache_indices_cpu[:num_non_spec_seqs].reshape(-1).to(
+                            dtype=torch.long,
+                            device=ssm_state.device,
+                        )
+                        has_initial_state_seq = causal_conv1d.has_initial_state_cpu[:num_non_spec_seqs].to(
+                            device=ssm_state.device,
+                        )
+                        cu_seqlens = non_spec_query_start_loc[: num_non_spec_seqs + 1]
                 else:
                     num_non_spec_seqs = attn_metadata.num_prefills
-                state_indices = non_spec_state_indices_tensor[:num_non_spec_seqs].reshape(-1).to(
-                    dtype=torch.long, device=ssm_state.device
-                )
+                    state_indices = non_spec_state_indices_tensor[:num_non_spec_seqs].reshape(-1).to(
+                        dtype=torch.long,
+                        device=ssm_state.device,
+                    )
+                    has_initial_state_seq = has_initial_state[:num_non_spec_seqs]
+                    cu_seqlens = non_spec_query_start_loc[: num_non_spec_seqs + 1]
                 initial_state = ssm_state.index_select(0, state_indices).contiguous()
                 initial_state = _mask_initial_state_rows(
                     initial_state,
-                    has_initial_state[:num_non_spec_seqs],
+                    has_initial_state_seq,
                 )
                 (
                     core_attn_out_non_spec,
@@ -551,7 +580,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     beta=beta_non_spec,
                     initial_state=initial_state,
                     output_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[: num_non_spec_seqs + 1],
+                    cu_seqlens=cu_seqlens,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )
