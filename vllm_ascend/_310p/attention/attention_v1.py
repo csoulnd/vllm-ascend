@@ -19,12 +19,18 @@ from typing import Any
 
 import torch
 import torch_npu
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.v1.attention.backends.registry import (  # type: ignore
     AttentionBackendEnum,
     register_backend,
 )
 
-from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
+from vllm_ascend._310p.attention.attention_mask import (
+    MASK_TYPE_NORM_COMPRESS,
+    AttentionMaskBuilder310,
+)
 from vllm_ascend._310p.attention.metadata_builder import AscendAttentionMetadataBuilder310
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -95,6 +101,57 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
     Implementation of attention operations (Prefill, Decode, Chunked Prefill)
     optimized for the Ascend 310P architecture.
     """
+
+    _splitfuse_v2_available: bool | None = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        cls = AscendAttentionBackendImpl310
+        if cls._splitfuse_v2_available is None:
+            cls._splitfuse_v2_available = hasattr(torch_npu, "_npu_paged_attention_splitfuse_v2")
+            if cls._splitfuse_v2_available:
+                logger.info(
+                    "310P SpecDecoding will use _npu_paged_attention_splitfuse_v2 "
+                    "(MASK_TYPE_NORM_COMPRESS, FP16 ND mask)."
+                )
+            else:
+                logger.info(
+                    "310P SpecDecoding: _npu_paged_attention_splitfuse_v2 not found in torch_npu; "
+                    "falling back to _npu_paged_attention_splitfuse (v1)."
+                )
+        self.splitfuse_v2_available = cls._splitfuse_v2_available
+
+    @staticmethod
+    def _num_tokens_for_splitfuse(attn_metadata) -> int:
+        num_tokens = int(attn_metadata.num_actual_tokens)
+        forward_context = get_forward_context()
+        if forward_context is None:
+            return num_tokens
+        aclgraph_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
+        padded_num_tokens = forward_context.num_tokens
+        if (
+            aclgraph_mode == CUDAGraphMode.FULL
+            and padded_num_tokens is not None
+            and padded_num_tokens > num_tokens
+        ):
+            return padded_num_tokens
+        return num_tokens
+
+    @staticmethod
+    def _get_query_lens_cpu(attn_metadata) -> torch.Tensor:
+        query_lens_cpu = getattr(attn_metadata, "query_lens_cpu", None)
+        if query_lens_cpu is not None:
+            return query_lens_cpu
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        if _EXTRA_CTX.capturing:
+            raise RuntimeError(
+                "310P splitfuse requires attn_metadata.query_lens_cpu during graph capture; "
+                "ensure AscendAttentionMetadataBuilder310.build() ran before forward."
+            )
+        # Eager-only fallback.
+        qsl_cpu = attn_metadata.query_start_loc.cpu()
+        return qsl_cpu[1:] - qsl_cpu[:-1]
 
     def _forward_encoder_attention(
         self,
@@ -214,18 +271,19 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         query = query[:num_actual_tokens]
         output = output[:num_actual_tokens]
 
-        # Calculate query lengths from start locations
-        qsl_cpu = attn_metadata.query_start_loc.cpu()
-        qlens = qsl_cpu[1:] - qsl_cpu[:-1]
+        # ATB splitfuse v1 expects host qLens; filled in metadata build (graph-safe).
+        qlens = self._get_query_lens_cpu(attn_metadata)
 
-        context_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_tables
 
         # Generate the specific mask for splitfuse
         mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device)
 
-        if context_lens.device != query.device:
-            context_lens = context_lens.to(query.device, non_blocking=True)
+        if attn_metadata.seq_lens.device != query.device:
+            attn_metadata.seq_lens = attn_metadata.seq_lens.to(
+                device=query.device,
+                non_blocking=True,
+            )
 
         torch_npu._npu_paged_attention_splitfuse(
             query=query,
@@ -234,13 +292,48 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             mask=mask,
             block_table=block_table,
             seq_len=qlens,
-            context_lens=context_lens,
+            context_lens=attn_metadata.seq_lens,
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             scale_value=self.scale,
             out=output,
         )
 
+        return output
+
+    def forward_spec_decoding_310(self, query, attn_metadata, output):
+        """MTP spec verify via ``_npu_paged_attention_splitfuse_v2`` when available."""
+        if not self.splitfuse_v2_available:
+            return self.forward_chunked_prefill_310(query, attn_metadata, output)
+
+        num_tokens = self._num_tokens_for_splitfuse(attn_metadata)
+        query = query[:num_tokens]
+        output = output[:num_tokens]
+
+        if attn_metadata.seq_lens.device != query.device:
+            attn_metadata.seq_lens = attn_metadata.seq_lens.to(
+                device=query.device,
+                non_blocking=True,
+            )
+
+        # ATB splitfuse v2 requires host qLensTensor; use pinned CPU buffer from metadata
+        # (updated before forward / graph replay, no D2H sync during capture).
+        qlens = self._get_query_lens_cpu(attn_metadata)
+
+        torch_npu._npu_paged_attention_splitfuse_v2(
+            query=query,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            block_table=attn_metadata.block_tables,
+            context_lens=attn_metadata.seq_lens,
+            mask=attn_metadata.attn_mask,
+            seq_len=qlens,
+            num_kv_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale_value=self.scale,
+            mask_type=MASK_TYPE_NORM_COMPRESS,
+            out=output,
+        )
         return output
 
     def forward_impl(self, query, key, value, kv_cache, attn_metadata, output):
@@ -275,7 +368,9 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         # Condition for PrefillCacheHit: Indicates prefill with some cached tokens already processed
         elif state in [AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit]:
             output = self.forward_chunked_prefill_310(query, attn_metadata, output)
-        # Condition for SpecDecoding: Specified for mtp, which is not supported yet.
+        # Condition for SpecDecoding: MTP spec verify (splitfuse v2 when available).
+        elif state == AscendAttentionState.SpecDecoding:
+            output = self.forward_spec_decoding_310(query, attn_metadata, output)
         else:
             raise NotImplementedError(f"AscendAttentionState: {state} is not supported for 310P currently.")
         return output
