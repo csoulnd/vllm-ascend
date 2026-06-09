@@ -137,6 +137,22 @@ class NPUModelRunner310(NPUModelRunner):
         if self.attn_state in (AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit):
             force_eager = True
 
+        # MTP: the first decode/spec verify step right after prefill must run eager
+        # so GDN conv/ssm state matches the draft path. FULL-graph replay at
+        # num_computed == num_prompt produces wrong verify logits (draft=8340,
+        # target=25) even when CPU/GPU counters are still aligned.
+        if (
+            not force_eager
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and num_reqs > 0
+            and np.any(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                == self.input_batch.num_prompt_tokens_cpu[:num_reqs]
+            )
+        ):
+            force_eager = True
+
         if force_uniform_decode is None and self.attn_state == AscendAttentionState.DecodeOnly:
             decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN
             if (
@@ -414,18 +430,6 @@ class NPUModelRunner310(NPUModelRunner):
         self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
-        if self.uses_mrope:
-            self._calc_mrope_positions(scheduler_output)
-            self.mrope_positions.gpu.copy_(
-                self.mrope_positions.cpu,
-                non_blocking=True,
-            )
-        elif self.uses_xdrope_dim > 0:
-            self._calc_xdrope_positions(scheduler_output)
-            self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
-            )
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -516,17 +520,26 @@ class NPUModelRunner310(NPUModelRunner):
                 non_blocking=True,
             )
 
-        if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
-            drift = self.num_computed_tokens[req_indices_gpu].to(
-                torch.int64
-            ) - self.input_batch.num_computed_tokens_cpu_tensor[req_indices].to(
-                device=self.device, dtype=torch.int64, non_blocking=True
+        if self.uses_mrope:
+            self._calc_mrope_positions(scheduler_output)
+            self.mrope_positions.gpu.copy_(
+                self.mrope_positions.cpu,
+                non_blocking=True,
             )
-            target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
-            target.gpu[:, :total_num_scheduled_tokens] += drift
+        elif self.uses_xdrope_dim > 0:
+            self._calc_xdrope_positions(scheduler_output)
+            self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
+                self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
+                non_blocking=True,
+            )
 
         if need_async_num_computed_update:
             self.seq_lens[:num_reqs] = self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+            # GPU num_computed is authoritative in async MTP; keep CPU counters
+            # aligned so token gather, GDN metadata, and debug traces match.
+            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].copy_(
+                self.num_computed_tokens[:num_reqs].detach().cpu()
+            )
         else:
             self.seq_lens[:num_reqs].copy_(
                 self.optimistic_seq_lens_cpu[:num_reqs],
