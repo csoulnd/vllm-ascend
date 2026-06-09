@@ -18,11 +18,16 @@
 from typing import Any
 
 import torch
+import torch_npu
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
-from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionMetadataBuilder,
+    AscendAttentionState,
+)
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
 
 class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
@@ -56,3 +61,24 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
         # Override the mask builder with the 310P-specific version
         max_model_len = vllm_config.model_config.max_model_len
         self.attn_mask_builder: Any = AttentionMaskBuilder310(self.device, max_model_len)
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        fast_build: bool = False,
+    ):
+        attn_metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+
+        if attn_metadata.attn_state != AscendAttentionState.SpecDecoding:
+            return attn_metadata
+
+        num_reqs = common_attn_metadata.num_reqs
+        # Align with mainline parallel_drafting: bind the device-side seq_lens
+        # view so graph replay updates the same buffer (not a CPU copy).
+        attn_metadata.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+
+        if hasattr(torch_npu, "_npu_paged_attention_splitfuse_v2"):
+            attn_metadata.attn_mask = self.attn_mask_builder.get_splitfuse_v2_causal_mask()
+
+        return attn_metadata
