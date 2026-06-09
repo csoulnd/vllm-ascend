@@ -39,15 +39,16 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.sample.rejection_sampler import RejectionSampler
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
 from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
+from vllm_ascend._310p.ops.fla.gdn_spec_metadata import postprocess_gdn_attn_metadata
 from vllm_ascend._310p.sample.sampler import AscendSampler310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -83,7 +84,7 @@ class NPUModelRunner310(NPUModelRunner):
         logger.info_once("Weight layout uses FRACTAL_NZ.")
         self.sampler = AscendSampler310()
         if getattr(self, "rejection_sampler", None) is not None:
-            self.rejection_sampler = RejectionSampler(self.sampler)
+            self.rejection_sampler = AscendRejectionSampler(self.sampler)
         if self.speculative_config is not None and self.speculative_config.method == "ngram":
             # 310P ngram requires decode-only graph shapes to be built with q_len=1.
             # Keep dispatcher's internal query_len in sync to avoid key-init assert.
@@ -102,6 +103,69 @@ class NPUModelRunner310(NPUModelRunner):
             # layout-change steps only.
             torch.npu.current_stream().synchronize()
         return deferred
+
+    def _mtp_full_graph_spec_decoding(self) -> bool:
+        return (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and self.attn_state == AscendAttentionState.SpecDecoding
+        )
+
+    def _sync_mtp_full_graph_phantom_metadata(
+        self,
+        num_reqs: int,
+        num_reqs_padded: int,
+    ) -> None:
+        """Align FIA phantom slots with FULL-graph capture metadata.
+
+        Uniform-batch padding extends ``query_start_loc`` with phantom requests
+        (each with q_len = 1 + num_spec). Capture fills all padded slots with
+        uniform spec/GDN metadata, but runtime left phantom ``seq_lens`` at 0
+        and ``num_decode_draft_tokens`` at -1. Splitfuse v2 then sees
+        ``context_lens=0`` with ``qlens>0``, which corrupts attention (worse
+        for MTP=2 where q_len=3).
+        """
+        if num_reqs_padded <= num_reqs:
+            return
+
+        num_spec = self.speculative_config.num_speculative_tokens
+        self.num_decode_draft_tokens.np[num_reqs:num_reqs_padded] = num_spec
+        self.num_decode_draft_tokens.copy_to_gpu()
+
+        last_seq_len = int(self.optimistic_seq_lens_cpu[num_reqs - 1].item())
+        self.optimistic_seq_lens_cpu[num_reqs:num_reqs_padded].fill_(last_seq_len)
+        self.seq_lens[num_reqs:num_reqs_padded] = last_seq_len
+
+        self.num_accepted_tokens.np[num_reqs:num_reqs_padded].fill(num_spec)
+        self.num_accepted_tokens.copy_to_gpu()
+
+        self._fill_mtp_full_graph_phantom_positions(num_reqs, num_reqs_padded)
+
+    def _fill_mtp_full_graph_phantom_positions(
+        self,
+        num_reqs: int,
+        num_reqs_padded: int,
+    ) -> None:
+        """Fill RoPE positions for FIA phantom tokens (slot_mapping stays PAD)."""
+        if num_reqs_padded <= num_reqs:
+            return
+
+        last_real_end = int(self.query_start_loc.np[num_reqs])
+        if last_real_end <= 0:
+            return
+
+        last_pos = int(self._positions_cpu_buf[last_real_end - 1])
+        for req_idx in range(num_reqs, num_reqs_padded):
+            start = int(self.query_start_loc.np[req_idx])
+            end = int(self.query_start_loc.np[req_idx + 1])
+            for offset, token_idx in enumerate(range(start, end)):
+                self._positions_cpu_buf[token_idx] = last_pos + offset + 1
+
+        total_padded = int(self.query_start_loc.np[num_reqs_padded])
+        self.positions[:total_padded].copy_(
+            self._positions_cpu_buf[:total_padded],
+            non_blocking=True,
+        )
 
     @contextmanager
     def temporary_modify_uniform_decode_query_len(self):
@@ -161,6 +225,67 @@ class NPUModelRunner310(NPUModelRunner):
             num_encoder_reqs=num_encoder_reqs,
         )
 
+    def _build_attention_metadata(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        max_query_len: int,
+        num_tokens_padded: int | None = None,
+        num_reqs_padded: int | None = None,
+        ubatch_slices=None,
+        logits_indices=None,
+        use_spec_decode: bool = False,
+        for_cudagraph_capture: bool = False,
+        num_scheduled_tokens=None,
+        num_scheduled_tokens_np=None,
+        cascade_attn_prefix_lens=None,
+        num_scheduled_tokens_compressed_list=None,
+    ):
+        # FULL decode-only + MTP: parent dummy_run sets ChunkedPrefill for non-MLA
+        # models. 310P must use SpecDecoding so self-attn (splitfuse v2) and GDN
+        # (conv1d/recurrent) both capture/replay in FULL graph.
+        mtp_full_graph_metadata = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and (for_cudagraph_capture or self.attn_state == AscendAttentionState.SpecDecoding)
+        )
+        if mtp_full_graph_metadata:
+            self.attn_state = AscendAttentionState.SpecDecoding
+            use_spec_decode = self._has_gdn
+            if for_cudagraph_capture:
+                num_reqs_for_draft = num_reqs_padded if num_reqs_padded is not None else num_reqs
+                num_spec = self.speculative_config.num_speculative_tokens
+                # Uniform decode graph shape: q_len = 1 + num_spec per request.
+                self.num_decode_draft_tokens.np[:num_reqs_for_draft] = num_spec
+                self.num_decode_draft_tokens.np[num_reqs_for_draft:].fill(-1)
+                self.num_decode_draft_tokens.copy_to_gpu()
+                self.num_accepted_tokens.np[:num_reqs_for_draft].fill(num_spec)
+                self.num_accepted_tokens.copy_to_gpu()
+            # build_for_graph_capture() hardcodes DecodeOnly; use build() so
+            # cm_base.attn_state=SpecDecoding flows into 310P/GDN metadata.
+            for_cudagraph_capture = False
+        num_reqs_padded_eff = num_reqs_padded if num_reqs_padded is not None else num_reqs
+        if mtp_full_graph_metadata and num_reqs_padded_eff > num_reqs:
+            self._sync_mtp_full_graph_phantom_metadata(num_reqs, num_reqs_padded_eff)
+        attn_metadata, spec_decode_cm = super()._build_attention_metadata(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            max_query_len=max_query_len,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs_padded=num_reqs_padded,
+            ubatch_slices=ubatch_slices,
+            logits_indices=logits_indices,
+            use_spec_decode=use_spec_decode,
+            for_cudagraph_capture=for_cudagraph_capture,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+            num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
+        )
+        if self._has_gdn and use_spec_decode:
+            postprocess_gdn_attn_metadata(attn_metadata)
+        return attn_metadata, spec_decode_cm
+
     def _pad_query_start_loc_for_fia(
         self,
         num_tokens_padded: int,
@@ -192,6 +317,9 @@ class NPUModelRunner310(NPUModelRunner):
             num_reqs_padded = num_reqs_padded + 1
 
         self.query_start_loc.copy_to_gpu()
+        if self._has_gdn and self._mtp_full_graph_spec_decoding():
+            self.gdn_query_start_loc.np[: num_reqs_padded + 1] = self.query_start_loc.np[: num_reqs_padded + 1]
+            self.gdn_query_start_loc.copy_to_gpu()
         return num_reqs_padded
 
     def _prepare_inputs(  # type: ignore[override]
@@ -551,6 +679,15 @@ class NPUModelRunner310(NPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
     ):
+        # FULL decode-only graph capture uses uniform q_len=1+num_spec and
+        # SpecDecoding (not parent ChunkedPrefill for non-MLA MTP).
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and (is_graph_capturing or cudagraph_runtime_mode == CUDAGraphMode.FULL)
+        ):
+            self.attn_state = AscendAttentionState.SpecDecoding
+
         temporary_context = self.temporary_modify_uniform_decode_query_len() if uniform_decode else nullcontext()
         with temporary_context:
             return super()._dummy_run(

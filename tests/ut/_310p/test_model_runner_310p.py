@@ -17,11 +17,53 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+
+
+def test_sync_mtp_full_graph_phantom_metadata_fills_phantom_slots() -> None:
+    runner = object.__new__(NPUModelRunner310)
+    runner.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=2)
+    runner.attn_state = AscendAttentionState.SpecDecoding
+    runner.optimistic_seq_lens_cpu = torch.tensor([100, 200, 0, 0], dtype=torch.int32)
+    runner.seq_lens = torch.zeros(4, dtype=torch.int32)
+    runner.num_decode_draft_tokens = MagicMock()
+    runner.num_decode_draft_tokens.np = np.array([-1, -1, -1, -1], dtype=np.int32)
+    runner.num_decode_draft_tokens.copy_to_gpu = MagicMock()
+    runner.num_accepted_tokens = MagicMock()
+    runner.num_accepted_tokens.np = np.array([1, 1, 1, 1], dtype=np.int32)
+    runner.num_accepted_tokens.copy_to_gpu = MagicMock()
+
+    runner._sync_mtp_full_graph_phantom_metadata(num_reqs=2, num_reqs_padded=4)
+
+    assert runner.num_decode_draft_tokens.np[2:4].tolist() == [2, 2]
+    assert runner.optimistic_seq_lens_cpu[2:4].tolist() == [200, 200]
+    assert runner.seq_lens[2:4].tolist() == [200, 200]
+    assert runner.num_accepted_tokens.np[2:4].tolist() == [2, 2]
+
+
+def test_sync_mtp_full_graph_phantom_metadata_noop_when_not_padded() -> None:
+    runner = object.__new__(NPUModelRunner310)
+    runner.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=2)
+    runner.attn_state = AscendAttentionState.SpecDecoding
+    runner.optimistic_seq_lens_cpu = torch.tensor([100, 200], dtype=torch.int32)
+    runner.seq_lens = torch.zeros(2, dtype=torch.int32)
+    runner.num_decode_draft_tokens = MagicMock()
+    runner.num_decode_draft_tokens.np = np.array([-1, -1], dtype=np.int32)
+    runner.num_decode_draft_tokens.copy_to_gpu = MagicMock()
+    runner.num_accepted_tokens = MagicMock()
+    runner.num_accepted_tokens.np = np.array([1, 1], dtype=np.int32)
+    runner.num_accepted_tokens.copy_to_gpu = MagicMock()
+
+    runner._sync_mtp_full_graph_phantom_metadata(num_reqs=2, num_reqs_padded=2)
+
+    assert runner.num_decode_draft_tokens.np.tolist() == [-1, -1]
+    runner.num_decode_draft_tokens.copy_to_gpu.assert_not_called()
 
 
 def _prepare_inputs_source() -> str:

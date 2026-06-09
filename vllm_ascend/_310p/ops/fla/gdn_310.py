@@ -19,10 +19,15 @@
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 
-from vllm_ascend.utils import enable_sp, vllm_version_is
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.compilation.acl_graph import get_draft_graph_params, get_graph_params
+from vllm_ascend._310p.ops.fla.gdn_spec_metadata import expand_spec_ssm_indices_cpu_for_query_len
+from vllm_ascend.ops.gdn import get_non_spec_causal_conv1d_host_args
+from vllm_ascend.utils import enable_sp, vllm_version_is, weak_ref_tensors
 
 if vllm_version_is("0.20.2"):
     from vllm.model_executor.layers.mamba.gdn_linear_attn import (  # type: ignore[import-not-found]
@@ -37,6 +42,113 @@ from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_r
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 
+_CONV1D_310_OP_BACKEND = "310"
+_CONV1D_310_BUFFER_REPLAY = "buffer_replay"
+
+
+def _copy_host_tuple_to_int64_buffer(
+    buffer: torch.Tensor,
+    host_tuple: tuple[int, ...],
+) -> None:
+    if not host_tuple:
+        return
+    num_elements = len(host_tuple)
+    cpu_values = torch.tensor(host_tuple, dtype=torch.int64, device="cpu", pin_memory=buffer.is_pinned())
+    buffer[:num_elements].copy_(cpu_values, non_blocking=True)
+
+
+def _as_int64_device_view(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.int64:
+        return tensor
+    return tensor.to(torch.int64)
+
+
+def _get_spec_causal_conv1d_device_args(
+    attn_metadata: GDNAttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_spec_decodes = attn_metadata.num_spec_decodes
+    query_start_loc_buf = _as_int64_device_view(attn_metadata.spec_query_start_loc)
+    cache_indices_buf = _as_int64_device_view(attn_metadata.spec_state_indices_tensor[:, 0])
+    num_accepted_buf = _as_int64_device_view(attn_metadata.num_accepted_tokens)
+    return (
+        query_start_loc_buf[: num_spec_decodes + 1],
+        cache_indices_buf[:num_spec_decodes],
+        num_accepted_buf[:num_spec_decodes],
+        query_start_loc_buf,
+        cache_indices_buf,
+        num_accepted_buf,
+    )
+
+
+def _get_non_spec_decode_causal_conv1d_device_args(
+    attn_metadata: GDNAttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_decodes = attn_metadata.num_decodes
+    query_start_loc_buf = _as_int64_device_view(attn_metadata.non_spec_query_start_loc)
+    cache_indices_buf = _as_int64_device_view(attn_metadata.non_spec_state_indices_tensor)
+    return (
+        query_start_loc_buf[: num_decodes + 1],
+        cache_indices_buf[: attn_metadata.num_actual_tokens],
+        query_start_loc_buf,
+        cache_indices_buf,
+    )
+
+
+def _spec_q_per_seq_for_conv1d(
+    attn_metadata: GDNAttentionMetadata,
+    num_actual_tokens: int,
+) -> int:
+    """Graph-safe q_len per spec request (no device tensor .item() / D2H sync)."""
+    num_spec_decodes = attn_metadata.num_spec_decodes
+    width = int(attn_metadata.spec_state_indices_tensor.size(-1))
+    if num_spec_decodes <= 0 or num_actual_tokens <= 0:
+        return width
+    if num_actual_tokens % num_spec_decodes != 0:
+        return width
+    # MTP verify uses q_len=1+num_spec; indices width may be num_spec only.
+    return max(width, num_actual_tokens // num_spec_decodes)
+
+
+def _register_310_conv1d_buffer_replay(
+    graph_params,
+    num_actual_tokens: int,
+    *,
+    mixed_qkv,
+    conv_weights,
+    conv_state,
+    bias,
+    activation_num: int,
+    run_mode: int,
+    branch: str,
+    layer_prefix: str,
+    qsl_dev: torch.Tensor,
+    cidx_dev: torch.Tensor,
+    nat_dev: torch.Tensor | None,
+    q_per_seq: int,
+) -> None:
+    graph_params.conv1d_params[num_actual_tokens].append(
+        (
+            None,
+            weak_ref_tensors(mixed_qkv),
+            weak_ref_tensors(conv_weights),
+            weak_ref_tensors(conv_state),
+            bias,
+            activation_num,
+            PAD_SLOT_ID,
+            run_mode,
+            branch,
+            layer_prefix,
+            weak_ref_tensors(qsl_dev),
+            weak_ref_tensors(cidx_dev),
+            weak_ref_tensors(nat_dev) if nat_dev is not None else None,
+            q_per_seq,
+            _CONV1D_310_OP_BACKEND,
+            _CONV1D_310_BUFFER_REPLAY,
+        )
+    )
+    graph_params.conv1d_handles[num_actual_tokens].append(None)
+    graph_params.conv1d_events[num_actual_tokens].append(None)
+
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return F.normalize(x.to(torch.float32), p=2, dim=-1, eps=eps).to(x.dtype)
@@ -50,15 +162,84 @@ def _flatten_state_indices(
     if ssm_state_indices.ndim == 1:
         return ssm_state_indices[:total_tokens].to(torch.int32).contiguous()
 
-    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    ssm_state_indices = ssm_state_indices[: seq_lens.shape[0]]
-    positions = torch.arange(
-        ssm_state_indices.shape[1],
-        device=ssm_state_indices.device,
-        dtype=seq_lens.dtype,
-    )
+    # masked_select on NPU triggers stream sync and breaks ACL graph capture.
+    # Compact 2D indices on CPU, then copy back asynchronously.
+    num_seqs = (cu_seqlens[1:] - cu_seqlens[:-1]).shape[0]
+    ssm_cpu = ssm_state_indices[:num_seqs].cpu()
+    seq_lens = cu_seqlens[1 : num_seqs + 1].cpu() - cu_seqlens[:num_seqs].cpu()
+    ssm_cpu = expand_spec_ssm_indices_cpu_for_query_len(ssm_cpu, seq_lens)
+    q_per_seq = ssm_cpu.shape[1]
+    positions = torch.arange(q_per_seq)
     valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
-    return ssm_state_indices.masked_select(valid)[:total_tokens].to(torch.int32).contiguous()
+    flat_cpu = ssm_cpu.masked_select(valid).to(torch.int32).contiguous()
+    if flat_cpu.numel() > total_tokens:
+        flat_cpu = flat_cpu[:total_tokens]
+    elif flat_cpu.numel() < total_tokens:
+        raise RuntimeError(
+            f"Flattened SSM indices ({flat_cpu.numel()}) shorter than "
+            f"spec tokens ({total_tokens}); check MTP spec_state_indices layout."
+        )
+    if not flat_cpu.is_pinned:
+        flat_cpu = flat_cpu.pin_memory()
+    flat_dev = torch.empty(
+        flat_cpu.numel(),
+        dtype=torch.int32,
+        device=ssm_state_indices.device,
+    )
+    flat_dev.copy_(flat_cpu, non_blocking=True)
+    return flat_dev.contiguous()
+
+
+def _host_tuple_to_int64_tensor(
+    host_tuple: tuple[int, ...],
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.tensor(host_tuple, dtype=torch.int64, device=device)
+
+
+def npu_causal_conv1d_310_from_host(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    query_start_loc_host: tuple[int, ...] | None,
+    cache_indices_host: tuple[int, ...] | None,
+    initial_state_mode_host: tuple[int, ...] | None,
+    num_accepted_tokens_host: tuple[int, ...] | None,
+    activation_num: int,
+    run_mode: int,
+    *,
+    query_start_loc_dev: torch.Tensor | None = None,
+    cache_indices_dev: torch.Tensor | None = None,
+    initial_state_mode_dev: torch.Tensor | None = None,
+    num_accepted_tokens_dev: torch.Tensor | None = None,
+) -> torch.Tensor:
+    device = mixed_qkv.device
+    query_start_loc = query_start_loc_dev
+    if query_start_loc is None and query_start_loc_host is not None:
+        query_start_loc = _host_tuple_to_int64_tensor(query_start_loc_host, device)
+    cache_indices = cache_indices_dev
+    if cache_indices is None and cache_indices_host is not None:
+        cache_indices = _host_tuple_to_int64_tensor(cache_indices_host, device)
+    initial_state_mode = initial_state_mode_dev
+    if initial_state_mode is None and initial_state_mode_host is not None:
+        initial_state_mode = _host_tuple_to_int64_tensor(initial_state_mode_host, device)
+    num_accepted_tokens = num_accepted_tokens_dev
+    if num_accepted_tokens is None and num_accepted_tokens_host is not None:
+        num_accepted_tokens = _host_tuple_to_int64_tensor(num_accepted_tokens_host, device)
+    return torch.ops._C_ascend.npu_causal_conv1d_310(
+        mixed_qkv,
+        conv_weights,
+        bias=bias,
+        conv_states=conv_state,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        initial_state_mode=initial_state_mode,
+        num_accepted_tokens=num_accepted_tokens,
+        activation_mode=activation_num,
+        pad_slot_id=PAD_SLOT_ID,
+        run_mode=run_mode,
+    )
 
 
 def npu_recurrent_gated_delta_rule_310(
@@ -72,13 +253,17 @@ def npu_recurrent_gated_delta_rule_310(
     ssm_state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    flat_ssm_state_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if use_qk_l2norm_in_kernel:
         q = _l2norm(q)
         k = _l2norm(k)
 
     total_tokens = v.shape[1]
-    flat_state_indices = _flatten_state_indices(ssm_state_indices, cu_seqlens, total_tokens)
+    if flat_ssm_state_indices is not None:
+        flat_state_indices = flat_ssm_state_indices[:total_tokens].to(torch.int32).contiguous()
+    else:
+        flat_state_indices = _flatten_state_indices(ssm_state_indices, cu_seqlens, total_tokens)
     actual_seq_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32).contiguous()
     accepted_tokens = None
     if num_accepted_tokens is not None:
@@ -171,15 +356,35 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            qsl_dev, cidx_dev, nat_dev, qsl_buf, cidx_buf, nat_buf = _get_spec_causal_conv1d_device_args(attn_metadata)
+            spec_q_per_seq = _spec_q_per_seq_for_conv1d(attn_metadata, mixed_qkv_spec.shape[0])
+            if _EXTRA_CTX.capturing:
+                graph_params = get_graph_params() if not _EXTRA_CTX.is_draft_model else get_draft_graph_params()
+                _register_310_conv1d_buffer_replay(
+                    graph_params,
+                    num_actual_tokens,
+                    mixed_qkv=mixed_qkv_spec,
+                    conv_weights=conv_weights,
+                    conv_state=conv_state,
+                    bias=self.conv1d.bias,
+                    activation_num=activation_num,
+                    run_mode=1,
+                    branch="spec",
+                    layer_prefix=self.prefix,
+                    qsl_dev=qsl_buf,
+                    cidx_dev=cidx_buf,
+                    nat_dev=nat_buf,
+                    q_per_seq=spec_q_per_seq,
+                )
             mixed_qkv_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
                 mixed_qkv_spec,
                 conv_weights,
                 bias=self.conv1d.bias,
                 conv_states=conv_state,
-                query_start_loc=spec_query_start_loc.to(torch.int64),
-                cache_indices=spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes].to(torch.int64),
+                query_start_loc=qsl_dev,
+                cache_indices=cidx_dev,
                 initial_state_mode=None,
-                num_accepted_tokens=num_accepted_tokens.to(torch.int64),
+                num_accepted_tokens=nat_dev,
                 activation_mode=activation_num,
                 pad_slot_id=PAD_SLOT_ID,
                 run_mode=1,
@@ -188,27 +393,48 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             if mixed_qkv_non_spec is not None:
-                mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
+                non_spec_qsl_host, non_spec_ci_host, non_spec_ism_host = get_non_spec_causal_conv1d_host_args(
+                    attn_metadata
+                )
+                mixed_qkv_non_spec = npu_causal_conv1d_310_from_host(
                     mixed_qkv_non_spec,
                     conv_weights,
-                    bias=self.conv1d.bias,
-                    conv_states=conv_state,
-                    query_start_loc=non_spec_query_start_loc.to(torch.int64),
-                    cache_indices=non_spec_state_indices_tensor.to(torch.int64),
-                    initial_state_mode=has_initial_state.to(torch.int64),
-                    num_accepted_tokens=None,
-                    activation_mode=activation_num,
-                    pad_slot_id=PAD_SLOT_ID,
-                    run_mode=0,
+                    self.conv1d.bias,
+                    conv_state,
+                    non_spec_qsl_host,
+                    non_spec_ci_host,
+                    non_spec_ism_host,
+                    None,
+                    activation_num,
+                    0,
                 )
         elif attn_metadata.num_decodes > 0:
+            qsl_dev, cidx_dev, qsl_buf, cidx_buf = _get_non_spec_decode_causal_conv1d_device_args(attn_metadata)
+            if _EXTRA_CTX.capturing:
+                graph_params = get_graph_params() if not _EXTRA_CTX.is_draft_model else get_draft_graph_params()
+                _register_310_conv1d_buffer_replay(
+                    graph_params,
+                    num_actual_tokens,
+                    mixed_qkv=mixed_qkv_non_spec,
+                    conv_weights=conv_weights,
+                    conv_state=conv_state,
+                    bias=self.conv1d.bias,
+                    activation_num=activation_num,
+                    run_mode=1,
+                    branch="non_spec_decode",
+                    layer_prefix=self.prefix,
+                    qsl_dev=qsl_buf,
+                    cidx_dev=cidx_buf,
+                    nat_dev=None,
+                    q_per_seq=1,
+                )
             mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
                 mixed_qkv_non_spec,
                 conv_weights,
                 bias=self.conv1d.bias,
                 conv_states=conv_state,
-                query_start_loc=None,
-                cache_indices=non_spec_state_indices_tensor[: attn_metadata.num_actual_tokens].to(torch.int64),
+                query_start_loc=qsl_dev,
+                cache_indices=cidx_dev,
                 initial_state_mode=None,
                 num_accepted_tokens=None,
                 activation_mode=activation_num,
@@ -243,6 +469,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
 
             # 2.1: Process the multi-query part
             if spec_sequence_masks is not None:
+                spec_flat_ssm_state_indices = getattr(attn_metadata, "spec_flat_ssm_state_indices", None)
                 core_attn_out_spec = npu_recurrent_gated_delta_rule_310(
                     q=query_spec,
                     k=key_spec,
@@ -254,6 +481,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
+                    flat_ssm_state_indices=spec_flat_ssm_state_indices,
                 )
             else:
                 core_attn_out_spec = None
