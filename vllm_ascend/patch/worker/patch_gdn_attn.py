@@ -24,7 +24,6 @@ from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _validate_cu_seqlens,
     build_chunk_meta_device,
 )
-from vllm_ascend.utils import is_310p
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -99,6 +98,57 @@ class _GDNCausalConv1dHostBufferSlot:
 class _GDNSpecCausalConv1dHostBufferSlot:
     cache_indices_cpu: torch.Tensor
     num_accepted_tokens_cpu: torch.Tensor
+
+
+@dataclass
+class _GDNSpecFlatSsmStateIndicesBufferSlot:
+    flat_ssm_state_indices: torch.Tensor
+
+
+def _expand_spec_ssm_indices_cpu_for_query_len(
+    ssm_cpu: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Expand rows when verify ``q_len`` exceeds ``spec_state_indices`` width.
+
+    Upstream ``spec_state_indices_tensor`` is often ``[num_spec, num_spec]`` (draft
+    slots) while MTP verify schedules ``1 + num_spec`` tokens per request. Without
+    expansion, flatten yields too few indices and recurrent reads stale pool bytes
+    for the remaining tokens (MTP=2: 2 indices per seq but 3 tokens).
+    """
+    if ssm_cpu.ndim == 1 or ssm_cpu.shape[1] == 0 or seq_lens.numel() == 0:
+        return ssm_cpu
+
+    q_per_seq = ssm_cpu.shape[1]
+    max_seq_len = int(seq_lens.max().item())
+    if max_seq_len <= q_per_seq:
+        return ssm_cpu
+
+    extra = max_seq_len - q_per_seq
+    if extra == 1:
+        # Leading target token reuses the first draft-slot index column.
+        return torch.cat([ssm_cpu[:, :1], ssm_cpu], dim=1)[:, :max_seq_len]
+
+    prefix = ssm_cpu[:, :1].expand(-1, extra)
+    return torch.cat([prefix, ssm_cpu], dim=1)[:, :max_seq_len]
+
+
+def _flatten_spec_ssm_state_indices_cpu(
+    spec_state_indices_tensor: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    num_spec_decodes: int,
+) -> torch.Tensor:
+    ssm_cpu = spec_state_indices_tensor[:num_spec_decodes].cpu()
+    if ssm_cpu.ndim == 1:
+        return ssm_cpu.to(torch.int32).contiguous()
+
+    cu_cpu = spec_query_start_loc[: num_spec_decodes + 1].cpu()
+    seq_lens = cu_cpu[1:] - cu_cpu[:-1]
+    ssm_cpu = _expand_spec_ssm_indices_cpu_for_query_len(ssm_cpu, seq_lens)
+    q_per_seq = ssm_cpu.shape[1]
+    positions = torch.arange(q_per_seq)
+    valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+    return ssm_cpu.masked_select(valid).to(torch.int32).contiguous()
 
 
 @dataclass
@@ -562,6 +612,72 @@ def _acquire_spec_causal_conv1d_host_slot(builder) -> _GDNSpecCausalConv1dHostBu
     return pool[builder._ascend_gdn_spec_causal_conv1d_host_pool_idx]
 
 
+def _allocate_spec_flat_ssm_state_indices_slot(
+    builder,
+    device: torch.device,
+) -> _GDNSpecFlatSsmStateIndicesBufferSlot:
+    max_num_seqs = builder.vllm_config.scheduler_config.max_num_seqs
+    spec_cfg = builder.vllm_config.speculative_config
+    num_speculative_tokens = spec_cfg.num_speculative_tokens if spec_cfg else 0
+    decode_cudagraph_max_bs = getattr(builder, "decode_cudagraph_max_bs", max_num_seqs)
+    max_elements = decode_cudagraph_max_bs * (num_speculative_tokens + 1)
+    return _GDNSpecFlatSsmStateIndicesBufferSlot(
+        flat_ssm_state_indices=torch.empty(
+            max_elements,
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+
+
+def _ensure_spec_flat_ssm_state_indices_state(builder, device: torch.device) -> None:
+    if getattr(builder, "_ascend_gdn_spec_flat_ssm_state_indices_initialized", False):
+        return
+    builder._ascend_gdn_spec_flat_ssm_state_indices_initialized = True
+    builder._ascend_gdn_spec_flat_ssm_state_indices_pool_idx = -1
+    builder._ascend_gdn_spec_flat_ssm_state_indices_pool = []
+    if device.type != "cpu":
+        builder._ascend_gdn_spec_flat_ssm_state_indices_pool = [
+            _allocate_spec_flat_ssm_state_indices_slot(builder, device),
+            _allocate_spec_flat_ssm_state_indices_slot(builder, device),
+        ]
+
+
+def _acquire_spec_flat_ssm_state_indices_slot(
+    builder,
+) -> _GDNSpecFlatSsmStateIndicesBufferSlot:
+    pool = builder._ascend_gdn_spec_flat_ssm_state_indices_pool
+    builder._ascend_gdn_spec_flat_ssm_state_indices_pool_idx = (
+        builder._ascend_gdn_spec_flat_ssm_state_indices_pool_idx + 1
+    ) % len(pool)
+    return pool[builder._ascend_gdn_spec_flat_ssm_state_indices_pool_idx]
+
+
+def _fill_spec_flat_ssm_state_indices(
+    builder,
+    attn_metadata: gdn_attn.GDNAttentionMetadata,
+) -> None:
+    if attn_metadata.spec_state_indices_tensor is None or attn_metadata.spec_query_start_loc is None:
+        attn_metadata.spec_flat_ssm_state_indices = None
+        return
+
+    flat_cpu = _flatten_spec_ssm_state_indices_cpu(
+        attn_metadata.spec_state_indices_tensor,
+        attn_metadata.spec_query_start_loc,
+        attn_metadata.num_spec_decodes,
+    )
+    if attn_metadata.spec_state_indices_tensor.device.type == "cpu":
+        attn_metadata.spec_flat_ssm_state_indices = flat_cpu
+        return
+
+    slot = _acquire_spec_flat_ssm_state_indices_slot(builder)
+    num_elements = flat_cpu.numel()
+    if not flat_cpu.is_pinned:
+        flat_cpu = flat_cpu.pin_memory()
+    slot.flat_ssm_state_indices[:num_elements].copy_(flat_cpu, non_blocking=True)
+    attn_metadata.spec_flat_ssm_state_indices = slot.flat_ssm_state_indices
+
+
 def _copy_to_pinned_cpu(
     tensor: torch.Tensor,
     pinned_buffer: torch.Tensor | None,
@@ -829,12 +945,11 @@ def _patched_build_spec(
             spec_query_start_loc_cpu,
         ),
     )
-    if is_310p():
-        from vllm_ascend._310p.ops.fla.gdn_spec_metadata import (
-            fill_spec_flat_ssm_state_indices_for_builder,
-        )
-
-        fill_spec_flat_ssm_state_indices_for_builder(self, attn_metadata)
+    _ensure_spec_flat_ssm_state_indices_state(
+        self,
+        common_attn_metadata.query_start_loc.device,
+    )
+    _fill_spec_flat_ssm_state_indices(self, attn_metadata)
     return attn_metadata
 
 

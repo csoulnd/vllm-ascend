@@ -25,8 +25,8 @@ from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import get_draft_graph_params, get_graph_params
-from vllm_ascend._310p.ops.fla.gdn_spec_metadata import expand_spec_ssm_indices_cpu_for_query_len
 from vllm_ascend.ops.gdn import get_non_spec_causal_conv1d_host_args
+from vllm_ascend.patch.worker.patch_gdn_attn import _expand_spec_ssm_indices_cpu_for_query_len
 from vllm_ascend.utils import enable_sp, vllm_version_is, weak_ref_tensors
 
 if vllm_version_is("0.20.2"):
@@ -167,7 +167,7 @@ def _flatten_state_indices(
     num_seqs = (cu_seqlens[1:] - cu_seqlens[:-1]).shape[0]
     ssm_cpu = ssm_state_indices[:num_seqs].cpu()
     seq_lens = cu_seqlens[1 : num_seqs + 1].cpu() - cu_seqlens[:num_seqs].cpu()
-    ssm_cpu = expand_spec_ssm_indices_cpu_for_query_len(ssm_cpu, seq_lens)
+    ssm_cpu = _expand_spec_ssm_indices_cpu_for_query_len(ssm_cpu, seq_lens)
     q_per_seq = ssm_cpu.shape[1]
     positions = torch.arange(q_per_seq)
     valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)

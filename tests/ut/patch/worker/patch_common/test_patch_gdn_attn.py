@@ -509,3 +509,18 @@ def test_builder_skips_prebuilt_meta_without_non_spec_prefill(batch_spec: BatchS
     )
 
     assert getattr(attn_metadata, "non_spec_prefill_fallback_meta", None) is None
+
+
+def test_flatten_spec_ssm_state_indices_expands_mtp_verify_query_len():
+    """MTP verify q_len=1+num_spec must flatten to one index per token."""
+    ssm = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+    qsl = torch.tensor([0, 3, 6], dtype=torch.int32)
+    flat = patch_gdn_attn._flatten_spec_ssm_state_indices_cpu(ssm, qsl, num_spec_decodes=2)
+    assert flat.tolist() == [10, 10, 11, 20, 20, 21]
+
+
+def test_flatten_spec_ssm_state_indices_unchanged_when_width_matches():
+    ssm = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
+    qsl = torch.tensor([0, 3, 6], dtype=torch.int32)
+    flat = patch_gdn_attn._flatten_spec_ssm_state_indices_cpu(ssm, qsl, num_spec_decodes=2)
+    assert flat.tolist() == [10, 11, 12, 20, 21, 22]
