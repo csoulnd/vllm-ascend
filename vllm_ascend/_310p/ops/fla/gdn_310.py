@@ -160,6 +160,43 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return F.normalize(x.to(torch.float32), p=2, dim=-1, eps=eps).to(x.dtype)
 
 
+def _mask_initial_state_rows(
+    initial_state: torch.Tensor,
+    has_initial_state: torch.Tensor,
+) -> torch.Tensor:
+    """Zero rows without cached initial state; avoid NPU boolean IndexPutV2."""
+    if initial_state.numel() == 0:
+        return initial_state
+    mask = has_initial_state.reshape(-1)
+    if mask.numel() != initial_state.shape[0]:
+        raise ValueError(
+            f"has_initial_state size mismatch: expected {initial_state.shape[0]}, got {mask.numel()}"
+        )
+    if mask.dtype != torch.bool:
+        mask = mask.to(torch.bool)
+    if mask.device != initial_state.device:
+        mask = mask.to(initial_state.device, non_blocking=True)
+    if mask.all():
+        return initial_state
+    if not mask.any():
+        return torch.zeros_like(initial_state)
+    expand_dims = (mask.numel(),) + (1,) * (initial_state.dim() - 1)
+    return torch.where(mask.view(expand_dims), initial_state, torch.zeros_like(initial_state))
+
+
+def _write_ssm_state_rows(
+    ssm_state: torch.Tensor,
+    row_indices: torch.Tensor,
+    row_values: torch.Tensor,
+) -> None:
+    """Write recurrent state rows without boolean advanced indexing on NPU."""
+    flat_indices = row_indices.reshape(-1).to(dtype=torch.long, device=ssm_state.device)
+    values = row_values.to(dtype=ssm_state.dtype, device=ssm_state.device).contiguous()
+    if flat_indices.numel() == 0:
+        return
+    ssm_state.index_copy_(0, flat_indices, values)
+
+
 def _flatten_state_indices(
     ssm_state_indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -494,8 +531,17 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
 
             # 2.2: Process the remaining part
             if attn_metadata.num_prefills > 0:
-                initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-                initial_state[~has_initial_state, ...] = 0
+                fallback_meta = getattr(attn_metadata, "non_spec_prefill_fallback_meta", None)
+                if fallback_meta is not None:
+                    num_non_spec_seqs = fallback_meta.causal_conv1d.query_start_loc_cpu.numel() - 1
+                else:
+                    num_non_spec_seqs = attn_metadata.num_prefills
+                state_indices = non_spec_state_indices_tensor[:num_non_spec_seqs]
+                initial_state = ssm_state[state_indices].contiguous()
+                initial_state = _mask_initial_state_rows(
+                    initial_state,
+                    has_initial_state[:num_non_spec_seqs],
+                )
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
@@ -507,13 +553,17 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     beta=beta_non_spec,
                     initial_state=initial_state,
                     output_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc,
+                    cu_seqlens=non_spec_query_start_loc[: num_non_spec_seqs + 1],
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )
 
                 # Init cache
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype)
+                _write_ssm_state_rows(
+                    ssm_state,
+                    state_indices,
+                    last_recurrent_state,
+                )
             elif attn_metadata.num_decodes > 0:
                 core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
                     q=query_non_spec,
