@@ -326,6 +326,22 @@ def _310p_get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
     return conv_state_dtype, torch.float16
 
 
+def _slice_decode_num_accepted_tokens(
+    num_accepted_tokens: torch.Tensor | None,
+    num_decodes: int,
+) -> torch.Tensor | None:
+    """Slice per-request num_accepted for non-spec decode paths.
+
+    MTP post#0 runs a 1-token decode while verify runs a 2-token spec forward
+    with num_accepted=1. The 310P conv1d/recurrent ops require the same
+    num_accepted_tokens on both paths so the first accepted token (90700)
+    produces identical hidden states.
+    """
+    if num_accepted_tokens is None or num_decodes <= 0:
+        return None
+    return num_accepted_tokens[:num_decodes].contiguous()
+
+
 _original_get_state_dtype = GatedDeltaNetAttention.get_state_dtype
 
 
@@ -440,6 +456,10 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     q_per_seq=1,
                 )
         elif attn_metadata.num_decodes > 0:
+            decode_nat = _slice_decode_num_accepted_tokens(
+                num_accepted_tokens,
+                attn_metadata.num_decodes,
+            )
             qsl, cidx, qsl_buf, cidx_buf = get_non_spec_decode_causal_conv1d_device_args(attn_metadata)
             mixed_qkv_non_spec = _run_causal_conv1d_310(
                 mixed_qkv_non_spec,
@@ -449,7 +469,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                 query_start_loc=qsl,
                 cache_indices=cidx,
                 initial_state_mode=None,
-                num_accepted_tokens=None,
+                num_accepted_tokens=decode_nat,
                 activation_num=activation_num,
                 run_mode=1,
                 graph_params_key=num_actual_tokens,
@@ -528,6 +548,10 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                 # Init cache
                 ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype)
             elif attn_metadata.num_decodes > 0:
+                decode_nat = _slice_decode_num_accepted_tokens(
+                    num_accepted_tokens,
+                    attn_metadata.num_decodes,
+                )
                 core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
                     q=query_non_spec,
                     k=key_non_spec,
@@ -537,12 +561,17 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     state=ssm_state,
                     cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
                     ssm_state_indices=non_spec_state_indices_tensor,
+                    num_accepted_tokens=decode_nat,
                     use_qk_l2norm_in_kernel=True,
                 )
             else:
                 core_attn_out_non_spec = None
 
         elif attn_metadata.num_decodes > 0:
+            decode_nat = _slice_decode_num_accepted_tokens(
+                num_accepted_tokens,
+                attn_metadata.num_decodes,
+            )
             core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
                 q=query_non_spec,
                 k=key_non_spec,
@@ -552,6 +581,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                 state=ssm_state,
                 cu_seqlens=non_spec_query_start_loc,
                 ssm_state_indices=non_spec_state_indices_tensor,
+                num_accepted_tokens=decode_nat,
                 use_qk_l2norm_in_kernel=True,
             )
         # 3. Merge core attention output

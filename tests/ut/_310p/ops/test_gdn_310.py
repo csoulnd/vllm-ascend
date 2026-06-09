@@ -51,3 +51,11 @@ def test_zero_rows_without_initial_state_rejects_size_mismatch():
     has_initial_state = torch.tensor([True])
     with pytest.raises(ValueError, match="size mismatch"):
         gdn_310._zero_rows_without_initial_state(initial_state, has_initial_state)
+
+
+def test_slice_decode_num_accepted_tokens():
+    assert gdn_310._slice_decode_num_accepted_tokens(None, 1) is None
+    assert gdn_310._slice_decode_num_accepted_tokens(torch.tensor([1, 2]), 0) is None
+    sliced = gdn_310._slice_decode_num_accepted_tokens(torch.tensor([1, 2, 3]), 2)
+    assert sliced is not None
+    assert sliced.tolist() == [1, 2]
