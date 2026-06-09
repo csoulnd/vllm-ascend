@@ -244,7 +244,12 @@ def update_full_graph_params(
         draft_attn_metadatas,
     )
 
-    from vllm_ascend.ops.gdn import update_conv1d_graph_params
+    from vllm_ascend.utils import is_310p
+
+    if is_310p():
+        from vllm_ascend._310p.ops.gdn_310_graph import update_conv1d_graph_params
+    else:
+        from vllm_ascend.ops.gdn import update_conv1d_graph_params
 
     # For GDN Attention: AscendC operate(conv1d update) update graph params
     # No patch can be loaded, update method call is temporarily placed here

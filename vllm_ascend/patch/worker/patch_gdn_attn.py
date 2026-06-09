@@ -50,8 +50,18 @@ class GDNChunkedPrefillMetadata:
 class GDNCausalConv1dHostMetadata:
     query_start_loc_cpu: torch.Tensor
     cache_indices_cpu: torch.Tensor
-    has_initial_state_cpu: torch.Tensor
+    has_initial_state_cpu: torch.Tensor | None
     _buffer_slot: object | None = None
+
+
+@dataclass
+class GDNCausalConv1dDeviceMetadata:
+    query_start_loc: torch.Tensor
+    cache_indices: torch.Tensor
+    has_initial_state: torch.Tensor | None
+    query_start_loc_buffer: torch.Tensor
+    cache_indices_buffer: torch.Tensor
+    has_initial_state_buffer: torch.Tensor | None = None
 
 
 @dataclass
@@ -63,19 +73,32 @@ class GDNSpecCausalConv1dHostMetadata:
 
 
 @dataclass
+class GDNSpecCausalConv1dDeviceMetadata:
+    query_start_loc: torch.Tensor
+    cache_indices: torch.Tensor
+    num_accepted_tokens: torch.Tensor
+    query_start_loc_buffer: torch.Tensor
+    cache_indices_buffer: torch.Tensor
+    num_accepted_tokens_buffer: torch.Tensor
+
+
+@dataclass
 class GDNPrefillFallbackMeta:
     causal_conv1d: GDNCausalConv1dHostMetadata
     chunk: GDNChunkedPrefillMetadata
+    causal_conv1d_device: GDNCausalConv1dDeviceMetadata | None = None
 
 
 @dataclass
 class GDNDecodeFallbackMeta:
     causal_conv1d: GDNCausalConv1dHostMetadata
+    causal_conv1d_device: GDNCausalConv1dDeviceMetadata | None = None
 
 
 @dataclass
 class GDNSpecDecodeFallbackMeta:
     spec_causal_conv1d: GDNSpecCausalConv1dHostMetadata
+    spec_causal_conv1d_device: GDNSpecCausalConv1dDeviceMetadata | None = None
 
 
 @dataclass
@@ -103,6 +126,20 @@ class _GDNSpecCausalConv1dHostBufferSlot:
 @dataclass
 class _GDNSpecFlatSsmStateIndicesBufferSlot:
     flat_ssm_state_indices: torch.Tensor
+
+
+@dataclass
+class _GDNCausalConv1dDeviceBufferSlot:
+    query_start_loc: torch.Tensor
+    cache_indices: torch.Tensor
+    has_initial_state: torch.Tensor
+
+
+@dataclass
+class _GDNSpecCausalConv1dDeviceBufferSlot:
+    query_start_loc: torch.Tensor
+    cache_indices: torch.Tensor
+    num_accepted_tokens: torch.Tensor
 
 
 def _flatten_spec_ssm_state_indices_cpu(
@@ -673,6 +710,157 @@ def _copy_to_pinned_cpu(
     return cpu_tensor
 
 
+def _copy_to_int64_device_buffer(
+    src: torch.Tensor,
+    buffer: torch.Tensor,
+) -> torch.Tensor:
+    num_elements = src.numel()
+    view = buffer[:num_elements]
+    view.copy_(src.reshape(-1).to(torch.int64), non_blocking=True)
+    return view
+
+
+def _allocate_causal_conv1d_device_slot(
+    builder,
+    device: torch.device,
+) -> _GDNCausalConv1dDeviceBufferSlot:
+    max_num_seqs = builder.vllm_config.scheduler_config.max_num_seqs
+    return _GDNCausalConv1dDeviceBufferSlot(
+        query_start_loc=torch.empty(max_num_seqs + 1, dtype=torch.int64, device=device),
+        cache_indices=torch.empty(max_num_seqs, dtype=torch.int64, device=device),
+        has_initial_state=torch.empty(max_num_seqs, dtype=torch.int64, device=device),
+    )
+
+
+def _ensure_causal_conv1d_device_meta_state(builder, device: torch.device) -> None:
+    if getattr(builder, "_ascend_gdn_causal_conv1d_device_meta_initialized", False):
+        return
+    builder._ascend_gdn_causal_conv1d_device_meta_initialized = True
+    builder._ascend_gdn_causal_conv1d_device_pool_idx = -1
+    builder._ascend_gdn_causal_conv1d_device_pool = []
+    if device.type != "cpu":
+        builder._ascend_gdn_causal_conv1d_device_pool = [
+            _allocate_causal_conv1d_device_slot(builder, device),
+            _allocate_causal_conv1d_device_slot(builder, device),
+        ]
+
+
+def _acquire_causal_conv1d_device_slot(builder) -> _GDNCausalConv1dDeviceBufferSlot:
+    pool = builder._ascend_gdn_causal_conv1d_device_pool
+    builder._ascend_gdn_causal_conv1d_device_pool_idx = (
+        builder._ascend_gdn_causal_conv1d_device_pool_idx + 1
+    ) % len(pool)
+    return pool[builder._ascend_gdn_causal_conv1d_device_pool_idx]
+
+
+def _allocate_spec_causal_conv1d_device_slot(
+    builder,
+    device: torch.device,
+) -> _GDNSpecCausalConv1dDeviceBufferSlot:
+    max_num_seqs = builder.vllm_config.scheduler_config.max_num_seqs
+    spec_cfg = builder.vllm_config.speculative_config
+    num_speculative_tokens = spec_cfg.num_speculative_tokens if spec_cfg else 0
+    decode_cudagraph_max_bs = getattr(builder, "decode_cudagraph_max_bs", max_num_seqs)
+    max_elements = decode_cudagraph_max_bs * (num_speculative_tokens + 1)
+    return _GDNSpecCausalConv1dDeviceBufferSlot(
+        query_start_loc=torch.empty(max_num_seqs + 1, dtype=torch.int64, device=device),
+        cache_indices=torch.empty(max_elements, dtype=torch.int64, device=device),
+        num_accepted_tokens=torch.empty(max_elements, dtype=torch.int64, device=device),
+    )
+
+
+def _ensure_spec_causal_conv1d_device_meta_state(builder, device: torch.device) -> None:
+    if getattr(builder, "_ascend_gdn_spec_causal_conv1d_device_meta_initialized", False):
+        return
+    builder._ascend_gdn_spec_causal_conv1d_device_meta_initialized = True
+    builder._ascend_gdn_spec_causal_conv1d_device_pool_idx = -1
+    builder._ascend_gdn_spec_causal_conv1d_device_pool = []
+    if device.type != "cpu":
+        builder._ascend_gdn_spec_causal_conv1d_device_pool = [
+            _allocate_spec_causal_conv1d_device_slot(builder, device),
+            _allocate_spec_causal_conv1d_device_slot(builder, device),
+        ]
+
+
+def _acquire_spec_causal_conv1d_device_slot(builder) -> _GDNSpecCausalConv1dDeviceBufferSlot:
+    pool = builder._ascend_gdn_spec_causal_conv1d_device_pool
+    builder._ascend_gdn_spec_causal_conv1d_device_pool_idx = (
+        builder._ascend_gdn_spec_causal_conv1d_device_pool_idx + 1
+    ) % len(pool)
+    return pool[builder._ascend_gdn_spec_causal_conv1d_device_pool_idx]
+
+
+def _build_non_spec_causal_conv1d_device_meta(
+    builder,
+    attn_metadata,
+) -> GDNCausalConv1dDeviceMetadata | None:
+    if attn_metadata.non_spec_query_start_loc is None:
+        return None
+    device = attn_metadata.non_spec_query_start_loc.device
+    if device.type == "cpu":
+        return None
+
+    _ensure_causal_conv1d_device_meta_state(builder, device)
+    slot = _acquire_causal_conv1d_device_slot(builder)
+    if attn_metadata.num_prefills > 0:
+        num_seqs = attn_metadata.num_prefills
+        qsl_src = attn_metadata.non_spec_query_start_loc[: num_seqs + 1]
+        cidx_src = attn_metadata.non_spec_state_indices_tensor
+        ism_src = attn_metadata.has_initial_state
+    else:
+        num_seqs = attn_metadata.num_decodes
+        qsl_src = attn_metadata.non_spec_query_start_loc[: num_seqs + 1]
+        cidx_src = attn_metadata.non_spec_state_indices_tensor[:num_seqs]
+        ism_src = None
+
+    qsl = _copy_to_int64_device_buffer(qsl_src, slot.query_start_loc)
+    cidx = _copy_to_int64_device_buffer(cidx_src, slot.cache_indices)
+    ism = None if ism_src is None else _copy_to_int64_device_buffer(ism_src.to(torch.int64), slot.has_initial_state)
+    return GDNCausalConv1dDeviceMetadata(
+        query_start_loc=qsl,
+        cache_indices=cidx,
+        has_initial_state=ism,
+        query_start_loc_buffer=slot.query_start_loc,
+        cache_indices_buffer=slot.cache_indices,
+        has_initial_state_buffer=None if ism is None else slot.has_initial_state,
+    )
+
+
+def _build_spec_causal_conv1d_device_meta(
+    builder,
+    attn_metadata,
+) -> GDNSpecCausalConv1dDeviceMetadata | None:
+    if attn_metadata.spec_query_start_loc is None:
+        return None
+    device = attn_metadata.spec_query_start_loc.device
+    if device.type == "cpu":
+        return None
+
+    _ensure_spec_causal_conv1d_device_meta_state(builder, device)
+    slot = _acquire_spec_causal_conv1d_device_slot(builder)
+    num_spec_decodes = attn_metadata.num_spec_decodes
+    qsl = _copy_to_int64_device_buffer(
+        attn_metadata.spec_query_start_loc[: num_spec_decodes + 1],
+        slot.query_start_loc,
+    )
+    cidx = _copy_to_int64_device_buffer(
+        attn_metadata.spec_state_indices_tensor[:num_spec_decodes, 0].contiguous(),
+        slot.cache_indices,
+    )
+    nat = _copy_to_int64_device_buffer(
+        attn_metadata.num_accepted_tokens[:num_spec_decodes].contiguous(),
+        slot.num_accepted_tokens,
+    )
+    return GDNSpecCausalConv1dDeviceMetadata(
+        query_start_loc=qsl,
+        cache_indices=cidx,
+        num_accepted_tokens=nat,
+        query_start_loc_buffer=slot.query_start_loc,
+        cache_indices_buffer=slot.cache_indices,
+        num_accepted_tokens_buffer=slot.num_accepted_tokens,
+    )
+
+
 def _build_non_spec_causal_conv1d_host_meta(
     builder,
     attn_metadata,
@@ -863,6 +1051,7 @@ def _patched_build_prefill(
             non_spec_query_start_loc_cpu,
             attn_metadata.non_spec_query_start_loc,
         ),
+        causal_conv1d_device=_build_non_spec_causal_conv1d_device_meta(self, attn_metadata),
     )
     return attn_metadata
 
@@ -915,6 +1104,7 @@ def _patched_build_spec(
             attn_metadata,
             spec_query_start_loc_cpu,
         ),
+        spec_causal_conv1d_device=_build_spec_causal_conv1d_device_meta(self, attn_metadata),
     )
     _ensure_spec_flat_ssm_state_indices_state(
         self,
@@ -948,6 +1138,7 @@ def _patched_build_decode(
             attn_metadata,
             non_spec_query_start_loc_cpu,
         ),
+        causal_conv1d_device=_build_non_spec_causal_conv1d_device_meta(self, attn_metadata),
     )
     return attn_metadata
 
@@ -955,6 +1146,8 @@ def _patched_build_decode(
 if not _IS_PATCHED:
     gdn_attn.GDNChunkedPrefillMetadata = GDNChunkedPrefillMetadata
     gdn_attn.GDNCausalConv1dHostMetadata = GDNCausalConv1dHostMetadata
+    gdn_attn.GDNCausalConv1dDeviceMetadata = GDNCausalConv1dDeviceMetadata
+    gdn_attn.GDNSpecCausalConv1dDeviceMetadata = GDNSpecCausalConv1dDeviceMetadata
     gdn_attn.GDNPrefillFallbackMeta = GDNPrefillFallbackMeta
     gdn_attn.GDNAttentionMetadataBuilder.build = _patched_build
     gdn_attn.GDNAttentionMetadataBuilder._init_reorder_batch_threshold = _init_reorder_batch_threshold

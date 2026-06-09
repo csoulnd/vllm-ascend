@@ -23,8 +23,8 @@ def test_normalize_core_attn_out_b1td_promotes_tnd():
 def test_merge_spec_non_spec_core_attn_out():
     spec_idx = torch.tensor([73, 74], dtype=torch.int64)
     non_spec_idx = torch.arange(73, dtype=torch.int64)
-    spec_out = torch.full((1, 2, 4), 1.0)
-    non_spec_out = torch.full((73, 4), 2.0)
+    spec_out = torch.full((1, 2, 4, 8), 1.0)
+    non_spec_out = torch.full((73, 4, 8), 2.0)
 
     merged = gdn_310._merge_spec_non_spec_core_attn_out(
         75,
@@ -33,7 +33,7 @@ def test_merge_spec_non_spec_core_attn_out():
         non_spec_idx,
         non_spec_out,
     )
-    assert merged.shape == (1, 75, 4)
+    assert merged.shape == (1, 75, 4, 8)
     assert torch.all(merged[0, :73] == 2.0)
     assert torch.all(merged[0, 73:] == 1.0)
 

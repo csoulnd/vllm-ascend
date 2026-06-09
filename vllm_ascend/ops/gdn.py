@@ -43,10 +43,10 @@ from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
     get_graph_params,
 )
-from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
+from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
 from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_fn
 from vllm_ascend.utils import weak_ref_tensors
 
@@ -171,11 +171,9 @@ def update_conv1d_graph_params(
             graph_params.conv1d_handles[num_tokens],
             graph_params.conv1d_events[num_tokens],
         ):
-            param_list = list(param)
-            op_backend = param_list[14] if len(param_list) > 14 else "custom"
-            replay_mode = param_list[15] if len(param_list) > 15 else "graph_task_update"
+            # Unpack parameters captured during graph capture
             (
-                _output,
+                output,
                 mixed_qkv,
                 conv_weights_T,
                 conv_state,
@@ -185,17 +183,18 @@ def update_conv1d_graph_params(
                 run_mode,
                 branch,
                 layer_prefix,
-                qsl_dev,
-                cidx_dev,
-                nat_dev,
+                _,
+                _,
+                _,
                 q_per_seq,
-            ) = param_list[:14]
+            ) = param
 
             new_query_start_loc: tuple[int, ...] = ()
             new_cache_indices: tuple[int, ...] = ()
             new_num_accepted: tuple[int, ...] = ()
 
             if run_mode == 1 and attn_metadata is not None:
+                # get gdn metadata by captured layer_prefix
                 meta = attn_metadata
                 if isinstance(meta, dict):
                     meta = meta.get(layer_prefix, None)
@@ -227,53 +226,23 @@ def update_conv1d_graph_params(
                     )
                     new_num_accepted = ()
 
-            if op_backend == "310" and replay_mode == "buffer_replay":
-                from vllm_ascend._310p.ops.fla.gdn_310 import _copy_host_tuple_to_int64_buffer
-
-                _copy_host_tuple_to_int64_buffer(qsl_dev, new_query_start_loc)
-                _copy_host_tuple_to_int64_buffer(cidx_dev, new_cache_indices)
-                if nat_dev is not None:
-                    _copy_host_tuple_to_int64_buffer(nat_dev, new_num_accepted)
-                continue
-
-            if handle is None:
-                continue
-
             torch.npu.graph_task_update_begin(update_stream, handle)
-            if op_backend == "310":
-                from vllm_ascend._310p.ops.fla.gdn_310 import npu_causal_conv1d_310_from_host
-
-                captured = npu_causal_conv1d_310_from_host(
-                    mixed_qkv,
-                    conv_weights_T,
-                    bias,
-                    conv_state,
-                    new_query_start_loc or None,
-                    new_cache_indices or None,
-                    None,
-                    new_num_accepted or None,
-                    activation_num,
-                    run_mode,
-                )
-                _output.copy_(captured)
-            else:
-                torch.ops._C_ascend.npu_causal_conv1d_custom(
-                    _output,
-                    mixed_qkv,
-                    conv_weights_T,
-                    conv_state=conv_state,
-                    bias_opt=bias,
-                    query_start_loc_opt=new_query_start_loc,
-                    cache_indices_opt=new_cache_indices,
-                    initial_state_mode_opt=(),
-                    num_accepted_tokens_opt=new_num_accepted,
-                    activation_mode=activation_num,
-                    pad_slot_id=pad_slot_id,
-                    run_mode=run_mode,
-                )
+            torch.ops._C_ascend.npu_causal_conv1d_custom(
+                output,
+                mixed_qkv,
+                conv_weights_T,
+                conv_state=conv_state,
+                bias_opt=bias,
+                query_start_loc_opt=new_query_start_loc,
+                cache_indices_opt=new_cache_indices,
+                initial_state_mode_opt=(),
+                num_accepted_tokens_opt=new_num_accepted,
+                activation_mode=activation_num,
+                pad_slot_id=pad_slot_id,
+                run_mode=run_mode,
+            )
             torch.npu.graph_task_update_end(update_stream)
-            if event is not None:
-                event.record(update_stream)
+            event.record(update_stream)
 
 
 def get_non_spec_chunked_prefill_meta(attn_metadata):
@@ -649,7 +618,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
-        g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        g, beta = fused_gdn_gating_patch(self.A_log, a, b, self.dt_bias)
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 g_spec = g
