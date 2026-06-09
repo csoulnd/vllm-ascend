@@ -46,16 +46,18 @@ else:
     import vllm_ascend.patch.worker.patch_idex_310  # noqa
 import vllm_ascend.patch.worker.patch_rejection_sampler  # noqa
 
-# torchair/npugraph_ex is only available on NPU; silently skip when missing
-# so that CPU-only environments (e.g. UT runners without torch_npu) can still
-# import this module without crashing.
-try:  # noqa: SIM105
-    import vllm_ascend.patch.worker.patch_npugraph_ex_triton  # noqa
-except ImportError:
-    pass
 import vllm_ascend.patch.worker.patch_kimi_k25  # noqa
 import vllm_ascend.patch.worker.patch_draft_quarot  # noqa
-import vllm_ascend.patch.worker.patch_cudagraph  # noqa
+
+if not is_310p():
+    # torchair/npugraph_ex is only available on NPU; silently skip when missing
+    # so that CPU-only environments (e.g. UT runners without torch_npu) can still
+    # import this module without crashing.
+    try:  # noqa: SIM105
+        import vllm_ascend.patch.worker.patch_npugraph_ex_triton  # noqa
+    except ImportError:
+        pass
+    import vllm_ascend.patch.worker.patch_cudagraph  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_mtp  # noqa
 import vllm_ascend.patch.worker.patch_gqa_c8  # noqa
 
