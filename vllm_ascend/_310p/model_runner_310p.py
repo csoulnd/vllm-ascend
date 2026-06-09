@@ -185,16 +185,17 @@ class NPUModelRunner310(NPUModelRunner):
         # FULL decode-only + MTP: parent dummy_run sets ChunkedPrefill for non-MLA
         # models. 310P must use SpecDecoding so self-attn (splitfuse v2) and GDN
         # (conv1d/recurrent) both capture/replay in FULL graph.
+        # Runtime prefill batches stay eager; only graph capture / spec-verify use this path.
+        is_runtime_prefill = not for_cudagraph_capture and self.attn_state in (
+            AscendAttentionState.PrefillNoCache,
+            AscendAttentionState.PrefillCacheHit,
+            AscendAttentionState.ChunkedPrefill,
+        )
         mtp_full_graph_metadata = (
             self.speculative_config is not None
             and self.speculative_config.method == "mtp"
             and (for_cudagraph_capture or self.attn_state == AscendAttentionState.SpecDecoding)
-            and self.attn_state
-            not in (
-                AscendAttentionState.PrefillNoCache,
-                AscendAttentionState.PrefillCacheHit,
-                AscendAttentionState.ChunkedPrefill,
-            )
+            and not is_runtime_prefill
         )
         if mtp_full_graph_metadata:
             self.attn_state = AscendAttentionState.SpecDecoding
