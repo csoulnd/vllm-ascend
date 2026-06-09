@@ -39,7 +39,6 @@ import vllm_ascend.patch.worker.patch_deepseek_compressor  # noqa
 
 if not is_310p():
     import vllm_ascend.patch.worker.patch_qwen3_5  # noqa
-    import vllm_ascend.patch.worker.patch_gdn_attn  # noqa
     import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa
     import vllm_ascend.patch.worker.patch_qwen3vl  # noqa
     # torchair/npugraph_ex is only available on NPU; silently skip when missing
@@ -52,6 +51,8 @@ if not is_310p():
     import vllm_ascend.patch.worker.patch_cudagraph
 else:
     import vllm_ascend.patch.worker.patch_idex_310  # noqa
+# GDN host metadata + graph replay helpers are required on 310P for MTP verify.
+import vllm_ascend.patch.worker.patch_gdn_attn  # noqa
 import vllm_ascend.patch.worker.patch_rejection_sampler  # noqa
 
 import vllm_ascend.patch.worker.patch_kimi_k25  # noqa

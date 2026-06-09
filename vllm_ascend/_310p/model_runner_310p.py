@@ -177,14 +177,29 @@ class NPUModelRunner310(NPUModelRunner):
         cascade_attn_prefix_lens=None,
         num_scheduled_tokens_compressed_list=None,
     ):
-        # Parent dummy_run assigns ChunkedPrefill to non-MLA MTP; 310P MTP verify
-        # uses splitfuse v2 under SpecDecoding and must capture the same path.
-        if (
-            for_cudagraph_capture
-            and self.speculative_config is not None
+        # FULL decode-only + MTP: parent dummy_run sets ChunkedPrefill for non-MLA
+        # models. 310P must use SpecDecoding so self-attn (splitfuse v2) and GDN
+        # (conv1d/recurrent) both capture/replay in FULL graph.
+        mtp_full_graph_metadata = (
+            self.speculative_config is not None
             and self.speculative_config.method == "mtp"
-        ):
+            and (for_cudagraph_capture or self.attn_state == AscendAttentionState.SpecDecoding)
+        )
+        if mtp_full_graph_metadata:
             self.attn_state = AscendAttentionState.SpecDecoding
+            use_spec_decode = self._has_gdn
+            if for_cudagraph_capture:
+                num_reqs_for_draft = num_reqs_padded if num_reqs_padded is not None else num_reqs
+                num_spec = self.speculative_config.num_speculative_tokens
+                # Uniform decode graph shape: q_len = 1 + num_spec per request.
+                self.num_decode_draft_tokens.np[:num_reqs_for_draft] = num_spec
+                self.num_decode_draft_tokens.np[num_reqs_for_draft:].fill(-1)
+                self.num_decode_draft_tokens.copy_to_gpu()
+                self.num_accepted_tokens.np[:num_reqs_for_draft].fill(num_spec)
+                self.num_accepted_tokens.copy_to_gpu()
+            # build_for_graph_capture() hardcodes DecodeOnly; use build() so
+            # cm_base.attn_state=SpecDecoding flows into 310P/GDN metadata.
+            for_cudagraph_capture = False
         return super()._build_attention_metadata(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
@@ -591,11 +606,8 @@ class NPUModelRunner310(NPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
     ):
-        # Parent dummy_run sets ChunkedPrefill for non-MLA MTP *after*
-        # _determine_batch_execution_and_padding. If a prior dummy_run left
-        # ChunkedPrefill on self.attn_state, 310P would force eager (NONE)
-        # while capture expects FULL. Set SpecDecoding before super() so
-        # determine/metadata both match the splitfuse v2 capture path.
+        # FULL decode-only graph capture uses uniform q_len=1+num_spec and
+        # SpecDecoding (not parent ChunkedPrefill for non-MLA MTP).
         if (
             self.speculative_config is not None
             and self.speculative_config.method == "mtp"
