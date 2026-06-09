@@ -94,7 +94,6 @@ def _get_non_spec_decode_causal_conv1d_device_args(
 
 def _get_non_spec_prefill_causal_conv1d_device_args(
     attn_metadata: GDNAttentionMetadata,
-    num_non_spec_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     fallback_meta = getattr(attn_metadata, "non_spec_prefill_fallback_meta", None)
     if fallback_meta is not None:
@@ -107,7 +106,7 @@ def _get_non_spec_prefill_causal_conv1d_device_args(
     initial_state_mode_buf = _as_int64_device_view(attn_metadata.has_initial_state)
     return (
         query_start_loc_buf[: num_non_spec_seqs + 1],
-        cache_indices_buf[:num_non_spec_tokens],
+        cache_indices_buf[:num_non_spec_seqs],
         initial_state_mode_buf[:num_non_spec_seqs],
         query_start_loc_buf,
         cache_indices_buf,
@@ -434,10 +433,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             if mixed_qkv_non_spec is not None:
-                num_non_spec_tokens = mixed_qkv_non_spec.shape[0]
-                qsl_dev, cidx_dev, ism_dev, _, _, _ = _get_non_spec_prefill_causal_conv1d_device_args(
-                    attn_metadata, num_non_spec_tokens
-                )
+                qsl_dev, cidx_dev, ism_dev, _, _, _ = _get_non_spec_prefill_causal_conv1d_device_args(attn_metadata)
                 mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
                     mixed_qkv_non_spec,
                     conv_weights,
@@ -536,8 +532,10 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     num_non_spec_seqs = fallback_meta.causal_conv1d.query_start_loc_cpu.numel() - 1
                 else:
                     num_non_spec_seqs = attn_metadata.num_prefills
-                state_indices = non_spec_state_indices_tensor[:num_non_spec_seqs]
-                initial_state = ssm_state[state_indices].contiguous()
+                state_indices = non_spec_state_indices_tensor[:num_non_spec_seqs].reshape(-1).to(
+                    dtype=torch.long, device=ssm_state.device
+                )
+                initial_state = ssm_state.index_select(0, state_indices).contiguous()
                 initial_state = _mask_initial_state_rows(
                     initial_state,
                     has_initial_state[:num_non_spec_seqs],
