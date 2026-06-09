@@ -180,6 +180,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
         conv_state = self_kv_cache[0]
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
+        num_accepted_tokens = attn_metadata.num_accepted_tokens
 
         if not enable_sp():
             mixed_qkv = mixed_qkv[:num_actual_tokens]
@@ -202,6 +203,9 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            # Align with spec sub-batch only (mixed prefill+spec has fewer spec decodes
+            # than total requests; full-batch tensor fails tiling / wrong state offset).
+            spec_num_accepted = num_accepted_tokens[: attn_metadata.num_spec_decodes].to(torch.int64)
             mixed_qkv_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
                 mixed_qkv_spec,
                 conv_weights,
@@ -210,10 +214,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                 query_start_loc=spec_query_start_loc.to(torch.int64),
                 cache_indices=spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes].to(torch.int64),
                 initial_state_mode=None,
-                # Forward must process every scheduled spec token (e.g. MTP q_len=2).
-                # num_accepted_tokens reflects post-rejection state and may truncate
-                # conv/recurrent outputs, breaking merge in mixed prefill+spec batches.
-                num_accepted_tokens=None,
+                num_accepted_tokens=spec_num_accepted,
                 activation_mode=activation_num,
                 pad_slot_id=PAD_SLOT_ID,
                 run_mode=1,
@@ -286,7 +287,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     state=ssm_state,
                     cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
                     ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=None,
+                    num_accepted_tokens=spec_num_accepted,
                     use_qk_l2norm_in_kernel=True,
                 )
             else:
