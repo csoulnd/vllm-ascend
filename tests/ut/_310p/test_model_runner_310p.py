@@ -32,6 +32,14 @@ def _prepare_inputs_source() -> str:
     return source[start:end]
 
 
+def test_build_attention_metadata_skips_mtp_gdn_override_during_prefill() -> None:
+    source_path = Path(__file__).resolve().parents[3] / "vllm_ascend" / "_310p" / "model_runner_310p.py"
+    source = source_path.read_text(encoding="utf-8")
+    assert "has_mtp_gdn_decode" in source
+    assert "for_cudagraph_capture or has_mtp_gdn_decode" in source
+    assert "Do not touch GDN/attn metadata during prefill" in source
+
+
 def test_prepare_inputs_keeps_aclgraph_metadata_on_cpu() -> None:
     source = _prepare_inputs_source()
 

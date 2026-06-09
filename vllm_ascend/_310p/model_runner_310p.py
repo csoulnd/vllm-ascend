@@ -203,7 +203,18 @@ class NPUModelRunner310(NPUModelRunner):
             and self.speculative_config.method == "mtp"
             and self._has_gdn
         )
-        if mtp_gdn_metadata:
+        has_mtp_gdn_decode = False
+        if mtp_gdn_metadata and num_reqs > 0:
+            for req_idx in range(num_reqs):
+                if (
+                    self.input_batch.num_computed_tokens_cpu[req_idx]
+                    >= self.input_batch.num_prompt_tokens[req_idx]
+                ):
+                    has_mtp_gdn_decode = True
+                    break
+        # Do not touch GDN/attn metadata during prefill — forcing SpecDecoding
+        # there breaks non-spec chunk metadata (out_chunk_offsets shape mismatch).
+        if mtp_gdn_metadata and (for_cudagraph_capture or has_mtp_gdn_decode):
             self.attn_state = AscendAttentionState.SpecDecoding
             use_spec_decode = True
             num_reqs_for_draft = num_reqs_padded if num_reqs_padded is not None else num_reqs
@@ -225,7 +236,6 @@ class NPUModelRunner310(NPUModelRunner):
                 self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
             if for_cudagraph_capture:
-                self.num_accepted_tokens.np[:num_reqs_for_draft].fill(num_spec)
                 self.num_accepted_tokens.copy_to_gpu()
             # build_for_graph_capture() hardcodes DecodeOnly; use build() so
             # cm_base.attn_state=SpecDecoding flows into 310P/GDN metadata.
