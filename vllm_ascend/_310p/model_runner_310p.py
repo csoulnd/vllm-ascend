@@ -561,6 +561,10 @@ class NPUModelRunner310(NPUModelRunner):
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
 
+            self._mtp_debug_log_pre_forward(
+                scheduler_output, spec_decode_metadata, num_draft_tokens, num_reqs
+            )
+
         self.logits_indices = logits_indices
 
         if self.lora_config:
