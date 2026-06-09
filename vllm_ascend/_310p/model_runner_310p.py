@@ -45,7 +45,6 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
 from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
-from vllm_ascend._310p.ops.fla.gdn_spec_metadata import postprocess_gdn_attn_metadata
 from vllm_ascend._310p.sample.sampler import AscendSampler310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
@@ -267,7 +266,7 @@ class NPUModelRunner310(NPUModelRunner):
         num_reqs_padded_eff = num_reqs_padded if num_reqs_padded is not None else num_reqs
         if mtp_full_graph_metadata and num_reqs_padded_eff > num_reqs:
             self._sync_mtp_full_graph_phantom_metadata(num_reqs, num_reqs_padded_eff)
-        attn_metadata, spec_decode_cm = super()._build_attention_metadata(
+        return super()._build_attention_metadata(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             max_query_len=max_query_len,
@@ -282,9 +281,6 @@ class NPUModelRunner310(NPUModelRunner):
             cascade_attn_prefix_lens=cascade_attn_prefix_lens,
             num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
         )
-        if self._has_gdn and use_spec_decode:
-            postprocess_gdn_attn_metadata(attn_metadata)
-        return attn_metadata, spec_decode_cm
 
     def _pad_query_start_loc_for_fia(
         self,

@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -31,7 +30,7 @@ class _FlatSsmStateIndicesBufferSlot:
 
 _POOL: list[_FlatSsmStateIndicesBufferSlot] = []
 _POOL_IDX = -1
-_INITIALIZED = False
+_POOL_MAX_ELEMENTS = 0
 
 
 def expand_spec_ssm_indices_cpu_for_query_len(
@@ -80,23 +79,32 @@ def flatten_spec_ssm_state_indices_cpu(
     return ssm_cpu.masked_select(valid).to(torch.int32).contiguous()
 
 
+def max_flat_ssm_elements_from_builder(builder) -> int:
+    """Match graph-capture upper bound: decode_cudagraph_max_bs * (1 + num_spec)."""
+    max_num_seqs = builder.vllm_config.scheduler_config.max_num_seqs
+    spec_cfg = builder.vllm_config.speculative_config
+    num_speculative_tokens = spec_cfg.num_speculative_tokens if spec_cfg else 0
+    decode_cudagraph_max_bs = getattr(builder, "decode_cudagraph_max_bs", max_num_seqs)
+    return decode_cudagraph_max_bs * (num_speculative_tokens + 1)
+
+
 def _ensure_flat_ssm_pool(device: torch.device, max_elements: int) -> None:
-    global _INITIALIZED, _POOL
-    if _INITIALIZED:
-        return
-    _INITIALIZED = True
+    global _POOL_MAX_ELEMENTS
     if device.type == "cpu":
         return
-    _POOL.extend(
-        [
-            _FlatSsmStateIndicesBufferSlot(
-                flat_ssm_state_indices=torch.empty(max_elements, dtype=torch.int32, device=device),
-            ),
-            _FlatSsmStateIndicesBufferSlot(
-                flat_ssm_state_indices=torch.empty(max_elements, dtype=torch.int32, device=device),
-            ),
-        ]
-    )
+    if max_elements > _POOL_MAX_ELEMENTS:
+        _POOL.clear()
+        _POOL.extend(
+            [
+                _FlatSsmStateIndicesBufferSlot(
+                    flat_ssm_state_indices=torch.empty(max_elements, dtype=torch.int32, device=device),
+                ),
+                _FlatSsmStateIndicesBufferSlot(
+                    flat_ssm_state_indices=torch.empty(max_elements, dtype=torch.int32, device=device),
+                ),
+            ]
+        )
+        _POOL_MAX_ELEMENTS = max_elements
 
 
 def _acquire_flat_ssm_slot() -> _FlatSsmStateIndicesBufferSlot:
@@ -108,7 +116,7 @@ def _acquire_flat_ssm_slot() -> _FlatSsmStateIndicesBufferSlot:
 def fill_spec_flat_ssm_state_indices(
     attn_metadata: GDNAttentionMetadata,
     *,
-    max_elements: int | None = None,
+    max_elements: int,
 ) -> None:
     """Pre-fill flattened SSM indices on CPU/NPU before graph replay (no D2H in forward)."""
     if attn_metadata.spec_state_indices_tensor is None or attn_metadata.spec_query_start_loc is None:
@@ -125,26 +133,24 @@ def fill_spec_flat_ssm_state_indices(
         return
 
     device = attn_metadata.spec_state_indices_tensor.device
-    if max_elements is None:
-        max_elements = flat_cpu.numel()
     _ensure_flat_ssm_pool(device, max_elements)
 
     slot = _acquire_flat_ssm_slot()
     num_elements = flat_cpu.numel()
+    if num_elements > max_elements:
+        raise RuntimeError(
+            f"Flattened SSM indices ({num_elements}) exceed graph buffer "
+            f"({max_elements}); check MTP spec_state_indices layout."
+        )
     if not flat_cpu.is_pinned:
         flat_cpu = flat_cpu.pin_memory()
     slot.flat_ssm_state_indices[:num_elements].copy_(flat_cpu, non_blocking=True)
     attn_metadata.spec_flat_ssm_state_indices = slot.flat_ssm_state_indices
 
 
-def postprocess_gdn_attn_metadata(attn_metadata: Any, *, max_elements: int | None = None) -> None:
-    """Fill 310P-only GDN spec metadata after the shared builder runs."""
-    if isinstance(attn_metadata, list):
-        for layer_metadata in attn_metadata:
-            postprocess_gdn_attn_metadata(layer_metadata, max_elements=max_elements)
-        return
-    if not isinstance(attn_metadata, dict):
-        return
-    for meta in attn_metadata.values():
-        if isinstance(meta, GDNAttentionMetadata) and meta.spec_sequence_masks is not None:
-            fill_spec_flat_ssm_state_indices(meta, max_elements=max_elements)
+def fill_spec_flat_ssm_state_indices_for_builder(builder, attn_metadata: GDNAttentionMetadata) -> None:
+    """Called from GDN metadata builder on 310P during spec-decode metadata build."""
+    fill_spec_flat_ssm_state_indices(
+        attn_metadata,
+        max_elements=max_flat_ssm_elements_from_builder(builder),
+    )

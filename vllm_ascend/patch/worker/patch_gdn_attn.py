@@ -24,6 +24,7 @@ from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _validate_cu_seqlens,
     build_chunk_meta_device,
 )
+from vllm_ascend.utils import is_310p
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -828,6 +829,12 @@ def _patched_build_spec(
             spec_query_start_loc_cpu,
         ),
     )
+    if is_310p():
+        from vllm_ascend._310p.ops.fla.gdn_spec_metadata import (
+            fill_spec_flat_ssm_state_indices_for_builder,
+        )
+
+        fill_spec_flat_ssm_state_indices_for_builder(self, attn_metadata)
     return attn_metadata
 
 
