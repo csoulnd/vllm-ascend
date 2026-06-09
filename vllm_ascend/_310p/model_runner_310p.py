@@ -494,10 +494,37 @@ class NPUModelRunner310(NPUModelRunner):
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
-        self.positions[:total_num_scheduled_tokens].copy_(
-            self._positions_cpu_buf[:total_num_scheduled_tokens],
-            non_blocking=True,
-        )
+        req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
+        # Align with mainline: after async num_computed correction, derive positions
+        # from GPU counters and refresh slot_mapping. Early CPU positions used stale
+        # num_computed_cpu and diverged from GPU after rejection sampling.
+        if self.pcp_size <= 1:
+            self.positions[:total_num_scheduled_tokens] = (
+                self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+                + self.query_pos.gpu[:total_num_scheduled_tokens]
+            )
+            positions_np[:total_num_scheduled_tokens] = (
+                self.positions[:total_num_scheduled_tokens].detach().cpu().numpy()
+            )
+            block_table.compute_slot_mapping(
+                req_indices,
+                positions_np[:total_num_scheduled_tokens],
+            )
+        else:
+            self.positions[:total_num_scheduled_tokens].copy_(
+                self._positions_cpu_buf[:total_num_scheduled_tokens],
+                non_blocking=True,
+            )
+
+        if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
+            drift = self.num_computed_tokens[req_indices_gpu].to(
+                torch.int64
+            ) - self.input_batch.num_computed_tokens_cpu_tensor[req_indices].to(
+                device=self.device, dtype=torch.int64, non_blocking=True
+            )
+            target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
+            target.gpu[:, :total_num_scheduled_tokens] += drift
+
         if need_async_num_computed_update:
             self.seq_lens[:num_reqs] = self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         else:
