@@ -349,6 +349,7 @@ def test_extract_non_spec_seq_cache_indices_filters_spec_sequences():
         per_token_indices,
         common_qsl,
         spec_masks,
+        num_non_spec_seqs=1,
     )
     assert torch.equal(filtered, torch.tensor([5], dtype=torch.int32))
 
@@ -357,8 +358,19 @@ def test_extract_non_spec_seq_cache_indices_filters_spec_sequences():
         per_seq_indices,
         common_qsl,
         spec_masks,
+        num_non_spec_seqs=1,
     )
     assert torch.equal(filtered_per_seq, torch.tensor([5], dtype=torch.int32))
+
+    # Already filtered to non-spec sequences only (MTP mixed batch layout).
+    non_spec_only_indices = torch.tensor([5], dtype=torch.int32)
+    filtered_non_spec_only = patch_gdn_attn._extract_non_spec_seq_cache_indices_cpu(
+        non_spec_only_indices,
+        common_qsl,
+        spec_masks,
+        num_non_spec_seqs=1,
+    )
+    assert torch.equal(filtered_non_spec_only, torch.tensor([5], dtype=torch.int32))
 
 
 def test_extract_non_spec_seq_has_initial_state_filters_spec_sequences():
@@ -368,8 +380,17 @@ def test_extract_non_spec_seq_has_initial_state_filters_spec_sequences():
     filtered = patch_gdn_attn._extract_non_spec_seq_has_initial_state_cpu(
         has_initial_state,
         spec_masks,
+        num_non_spec_seqs=1,
     )
     assert torch.equal(filtered, torch.tensor([True]))
+
+    non_spec_only = torch.tensor([True])
+    filtered_non_spec_only = patch_gdn_attn._extract_non_spec_seq_has_initial_state_cpu(
+        non_spec_only,
+        spec_masks,
+        num_non_spec_seqs=1,
+    )
+    assert torch.equal(filtered_non_spec_only, torch.tensor([True]))
 
 
 def test_build_non_spec_causal_conv1d_host_meta_requires_has_initial_state():

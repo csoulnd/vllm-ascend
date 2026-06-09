@@ -702,6 +702,7 @@ def _extract_non_spec_seq_cache_indices_cpu(
     non_spec_state_indices_tensor: torch.Tensor,
     common_query_start_loc_cpu: torch.Tensor,
     spec_sequence_masks_cpu: torch.Tensor | None,
+    num_non_spec_seqs: int | None = None,
 ) -> torch.Tensor:
     flat_cpu = (
         non_spec_state_indices_tensor.reshape(-1).cpu()
@@ -709,6 +710,16 @@ def _extract_non_spec_seq_cache_indices_cpu(
         else non_spec_state_indices_tensor.reshape(-1)
     )
     num_seqs = common_query_start_loc_cpu.numel() - 1
+    if num_non_spec_seqs is None:
+        if spec_sequence_masks_cpu is None:
+            num_non_spec_seqs = num_seqs
+        else:
+            num_non_spec_seqs = int((~spec_sequence_masks_cpu).sum().item())
+
+    # Already filtered to one entry per non-spec sequence.
+    if flat_cpu.numel() == num_non_spec_seqs:
+        return flat_cpu
+
     if flat_cpu.numel() == num_seqs:
         if spec_sequence_masks_cpu is None:
             return flat_cpu
@@ -725,10 +736,20 @@ def _extract_non_spec_seq_cache_indices_cpu(
 def _extract_non_spec_seq_has_initial_state_cpu(
     has_initial_state: torch.Tensor,
     spec_sequence_masks_cpu: torch.Tensor | None,
+    num_non_spec_seqs: int | None = None,
 ) -> torch.Tensor:
     cpu_tensor = has_initial_state.reshape(-1)
     if cpu_tensor.device.type != "cpu":
         cpu_tensor = cpu_tensor.cpu()
+    if num_non_spec_seqs is None:
+        if spec_sequence_masks_cpu is None:
+            num_non_spec_seqs = cpu_tensor.numel()
+        else:
+            num_non_spec_seqs = int((~spec_sequence_masks_cpu).sum().item())
+
+    if cpu_tensor.numel() == num_non_spec_seqs:
+        return cpu_tensor
+
     if spec_sequence_masks_cpu is None:
         return cpu_tensor
     return cpu_tensor[~spec_sequence_masks_cpu]
@@ -782,14 +803,17 @@ def _build_non_spec_causal_conv1d_host_meta(
 
     spec_sequence_masks_cpu = _build_spec_sequence_masks_cpu(builder, num_decode_draft_tokens_cpu)
     common_query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+    num_non_spec_seqs = non_spec_query_start_loc_cpu.numel() - 1
     cache_indices_filtered = _extract_non_spec_seq_cache_indices_cpu(
         attn_metadata.non_spec_state_indices_tensor,
         common_query_start_loc_cpu,
         spec_sequence_masks_cpu,
+        num_non_spec_seqs=num_non_spec_seqs,
     )
     has_initial_state_filtered = _extract_non_spec_seq_has_initial_state_cpu(
         attn_metadata.has_initial_state,
         spec_sequence_masks_cpu,
+        num_non_spec_seqs=num_non_spec_seqs,
     )
 
     slot = None
