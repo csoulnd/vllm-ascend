@@ -134,7 +134,12 @@ class NPUModelRunner310(NPUModelRunner):
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
     ):
-        if self.attn_state in (AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit):
+        # Prefill batches never enter ACL graph; only uniform decode/spec-verify does.
+        if self.attn_state in (
+            AscendAttentionState.PrefillNoCache,
+            AscendAttentionState.PrefillCacheHit,
+            AscendAttentionState.ChunkedPrefill,
+        ) or getattr(self, "with_prefill", False):
             force_eager = True
 
         if force_uniform_decode is None and self.attn_state == AscendAttentionState.DecodeOnly:
@@ -184,6 +189,12 @@ class NPUModelRunner310(NPUModelRunner):
             self.speculative_config is not None
             and self.speculative_config.method == "mtp"
             and (for_cudagraph_capture or self.attn_state == AscendAttentionState.SpecDecoding)
+            and self.attn_state
+            not in (
+                AscendAttentionState.PrefillNoCache,
+                AscendAttentionState.PrefillCacheHit,
+                AscendAttentionState.ChunkedPrefill,
+            )
         )
         if mtp_full_graph_metadata:
             self.attn_state = AscendAttentionState.SpecDecoding

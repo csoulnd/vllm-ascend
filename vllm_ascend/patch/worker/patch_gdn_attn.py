@@ -831,6 +831,42 @@ def _patched_build(
     return attn_metadata
 
 
+def _sync_non_spec_prefill_device_tensors(
+    attn_metadata: gdn_attn.GDNAttentionMetadata,
+    non_spec_query_start_loc_cpu: torch.Tensor,
+    causal_conv1d_meta: GDNCausalConv1dHostMetadata,
+) -> None:
+    non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+    if non_spec_query_start_loc.device.type == "cpu":
+        return
+
+    num_qsl = non_spec_query_start_loc_cpu.numel()
+    non_spec_query_start_loc[:num_qsl].copy_(
+        non_spec_query_start_loc_cpu.to(
+            device=non_spec_query_start_loc.device,
+            non_blocking=True,
+        )
+    )
+
+    non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
+    num_ci = causal_conv1d_meta.cache_indices_cpu.numel()
+    non_spec_state_indices_tensor[:num_ci].copy_(
+        causal_conv1d_meta.cache_indices_cpu.to(
+            device=non_spec_state_indices_tensor.device,
+            non_blocking=True,
+        )
+    )
+
+    has_initial_state = attn_metadata.has_initial_state
+    num_ism = causal_conv1d_meta.has_initial_state_cpu.numel()
+    has_initial_state[:num_ism].copy_(
+        causal_conv1d_meta.has_initial_state_cpu.to(
+            device=has_initial_state.device,
+            non_blocking=True,
+        )
+    )
+
+
 def _patched_build_prefill(
     self,
     attn_metadata: gdn_attn.GDNAttentionMetadata,
@@ -852,12 +888,18 @@ def _patched_build_prefill(
     assert non_spec_query_start_loc_cpu is not None
     if attn_metadata.non_spec_query_start_loc is None:
         raise RuntimeError("Expected attn_metadata.non_spec_query_start_loc for patched GDN non-spec prefill path.")
+    causal_conv1d_meta = _build_non_spec_causal_conv1d_host_meta(
+        self,
+        attn_metadata,
+        non_spec_query_start_loc_cpu,
+    )
+    _sync_non_spec_prefill_device_tensors(
+        attn_metadata,
+        non_spec_query_start_loc_cpu,
+        causal_conv1d_meta,
+    )
     attn_metadata.non_spec_prefill_fallback_meta = GDNPrefillFallbackMeta(
-        causal_conv1d=_build_non_spec_causal_conv1d_host_meta(
-            self,
-            attn_metadata,
-            non_spec_query_start_loc_cpu,
-        ),
+        causal_conv1d=causal_conv1d_meta,
         chunk=_build_non_spec_chunked_prefill_meta(
             self,
             non_spec_query_start_loc_cpu,

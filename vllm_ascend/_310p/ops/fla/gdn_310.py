@@ -25,7 +25,6 @@ from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import get_draft_graph_params, get_graph_params
-from vllm_ascend.ops.gdn import get_non_spec_causal_conv1d_host_args
 from vllm_ascend.utils import enable_sp, vllm_version_is, weak_ref_tensors
 
 if vllm_version_is("0.20.2"):
@@ -90,6 +89,29 @@ def _get_non_spec_decode_causal_conv1d_device_args(
         cache_indices_buf[: attn_metadata.num_actual_tokens],
         query_start_loc_buf,
         cache_indices_buf,
+    )
+
+
+def _get_non_spec_prefill_causal_conv1d_device_args(
+    attn_metadata: GDNAttentionMetadata,
+    num_non_spec_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    fallback_meta = getattr(attn_metadata, "non_spec_prefill_fallback_meta", None)
+    if fallback_meta is not None:
+        num_non_spec_seqs = fallback_meta.causal_conv1d.query_start_loc_cpu.numel() - 1
+    else:
+        num_non_spec_seqs = attn_metadata.num_prefills
+
+    query_start_loc_buf = _as_int64_device_view(attn_metadata.non_spec_query_start_loc)
+    cache_indices_buf = _as_int64_device_view(attn_metadata.non_spec_state_indices_tensor)
+    initial_state_mode_buf = _as_int64_device_view(attn_metadata.has_initial_state)
+    return (
+        query_start_loc_buf[: num_non_spec_seqs + 1],
+        cache_indices_buf[:num_non_spec_tokens],
+        initial_state_mode_buf[:num_non_spec_seqs],
+        query_start_loc_buf,
+        cache_indices_buf,
+        initial_state_mode_buf,
     )
 
 
@@ -170,7 +192,12 @@ def _host_tuple_to_int64_tensor(
     host_tuple: tuple[int, ...],
     device: torch.device,
 ) -> torch.Tensor:
-    return torch.tensor(host_tuple, dtype=torch.int64, device=device)
+    if not host_tuple:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    cpu_values = torch.tensor(host_tuple, dtype=torch.int64, device="cpu", pin_memory=True)
+    dev = torch.empty(len(host_tuple), dtype=torch.int64, device=device)
+    dev.copy_(cpu_values, non_blocking=True)
+    return dev
 
 
 def npu_causal_conv1d_310_from_host(
@@ -334,7 +361,8 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             qsl_dev, cidx_dev, nat_dev, qsl_buf, cidx_buf, nat_buf = _get_spec_causal_conv1d_device_args(attn_metadata)
             spec_q_per_seq = int(attn_metadata.spec_state_indices_tensor.size(-1))
-            if _EXTRA_CTX.capturing:
+            # Graph capture/replay is decode-only; skip when prefill tokens are present.
+            if _EXTRA_CTX.capturing and attn_metadata.num_prefills == 0:
                 graph_params = get_graph_params() if not _EXTRA_CTX.is_draft_model else get_draft_graph_params()
                 _register_310_conv1d_buffer_replay(
                     graph_params,
@@ -369,20 +397,22 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             if mixed_qkv_non_spec is not None:
-                non_spec_qsl_host, non_spec_ci_host, non_spec_ism_host = get_non_spec_causal_conv1d_host_args(
-                    attn_metadata
+                num_non_spec_tokens = mixed_qkv_non_spec.shape[0]
+                qsl_dev, cidx_dev, ism_dev, _, _, _ = _get_non_spec_prefill_causal_conv1d_device_args(
+                    attn_metadata, num_non_spec_tokens
                 )
-                mixed_qkv_non_spec = npu_causal_conv1d_310_from_host(
+                mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
                     mixed_qkv_non_spec,
                     conv_weights,
-                    self.conv1d.bias,
-                    conv_state,
-                    non_spec_qsl_host,
-                    non_spec_ci_host,
-                    non_spec_ism_host,
-                    None,
-                    activation_num,
-                    0,
+                    bias=self.conv1d.bias,
+                    conv_states=conv_state,
+                    query_start_loc=qsl_dev,
+                    cache_indices=cidx_dev,
+                    initial_state_mode=ism_dev,
+                    num_accepted_tokens=None,
+                    activation_mode=activation_num,
+                    pad_slot_id=PAD_SLOT_ID,
+                    run_mode=0,
                 )
         elif attn_metadata.num_decodes > 0:
             qsl_dev, cidx_dev, qsl_buf, cidx_buf = _get_non_spec_decode_causal_conv1d_device_args(attn_metadata)
