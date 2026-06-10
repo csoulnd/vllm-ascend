@@ -503,6 +503,21 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                 core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)[:num_actual_tokens]
         maybe_save_kv_layer_to_connector("", [])
 
+
+
+def _get_spec_causal_conv1d_update_host_args_310p(
+    attn_metadata: GDNAttentionMetadata,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Build spec conv1d host args from GDN metadata without patch_gdn_attn."""
+    from vllm_ascend.ops.gdn import to_int64_tuple
+
+    num_spec_decodes = attn_metadata.num_spec_decodes
+    return (
+        to_int64_tuple(attn_metadata.spec_query_start_loc[: num_spec_decodes + 1]),
+        to_int64_tuple(attn_metadata.spec_state_indices_tensor[:, 0][:num_spec_decodes]),
+        to_int64_tuple(attn_metadata.num_accepted_tokens[:num_spec_decodes]),
+    )
+
 def update_conv1d_graph_params_310p(
     update_stream,
     forward_context,
@@ -512,10 +527,7 @@ def update_conv1d_graph_params_310p(
     draft_attn_metadatas=None,
 ):
     """310P uniform spec-decode GDN conv1d graph replay via device buffer updates."""
-    from vllm_ascend.ops.gdn import (
-        _pad_conv1d_host_args_to_capture,
-        get_spec_causal_conv1d_update_host_args,
-    )
+    from vllm_ascend.ops.gdn import _pad_conv1d_host_args_to_capture
 
     graph_params = get_draft_graph_params() if is_draft_model else get_graph_params()
 
@@ -569,7 +581,7 @@ def update_conv1d_graph_params_310p(
                 continue
 
             cap_x_dim0 = int(mixed_qkv.size(0))
-            qsl_host, cidx_host, num_accepted_host = get_spec_causal_conv1d_update_host_args(meta)
+            qsl_host, cidx_host, num_accepted_host = _get_spec_causal_conv1d_update_host_args_310p(meta)
             new_query_start_loc, new_cache_indices, new_num_accepted = _pad_conv1d_host_args_to_capture(
                 qsl_host,
                 cidx_host,
