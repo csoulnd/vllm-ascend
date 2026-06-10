@@ -260,7 +260,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         """
         num_actual_tokens = int(attn_metadata.num_actual_tokens)
         query = query[:num_actual_tokens]
-        output = output[:num_actual_tokens]
+        output_slice = output[:num_actual_tokens]
 
         # ATB splitfuse expects host qLens; filled in metadata build (graph-safe).
         qlens = self._get_query_lens_cpu(attn_metadata)
@@ -288,7 +288,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
                 num_heads=self.num_heads,
                 scale_value=self.scale,
                 mask_type=MASK_TYPE_NORM_COMPRESS_PAGED_ATTENTION,
-                out=output,
+                out=output_slice,
             )
             return output
 
@@ -305,7 +305,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             scale_value=self.scale,
-            out=output,
+            out=output_slice,
         )
 
         return output
