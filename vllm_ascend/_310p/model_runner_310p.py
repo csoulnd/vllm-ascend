@@ -226,6 +226,18 @@ class NPUModelRunner310(NPUModelRunner):
         self.query_start_loc.copy_to_gpu()
         return num_reqs_padded
 
+    def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
+        attn_state = super()._build_attn_state(num_reqs, num_scheduled_tokens, num_valid_tokens)
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and not np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0)
+            and np.all(num_scheduled_tokens == self.uniform_decode_query_len)
+        ):
+            attn_state = AscendAttentionState.SpecDecoding
+            self.attn_state = attn_state
+        return attn_state
+
     def _prepare_inputs(  # type: ignore[override]
         self,
         scheduler_output: SchedulerOutput,

@@ -274,10 +274,8 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             )
 
         if self.support_compressed_mask:
-            if attn_metadata.attn_mask is not None:
-                mask = attn_metadata.attn_mask
-            else:
-                mask = AttentionMaskBuilder310.get_compressed_splitfuse_mask(query.device)
+            # splitfuse_v2 requires fixed ND [2048, 2048]; parent build() may set FRACTAL_NZ mask.
+            mask = AttentionMaskBuilder310.get_compressed_splitfuse_mask(query.device)
             torch_npu._npu_paged_attention_splitfuse_v2(
                 query=query,
                 key_cache=self.key_cache,

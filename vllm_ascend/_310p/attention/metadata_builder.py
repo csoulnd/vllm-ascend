@@ -98,7 +98,11 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
 
         num_reqs = common_attn_metadata.num_reqs
 
-        if attn_metadata.attn_state != AscendAttentionState.SpecDecoding:
+        splitfuse_states = (
+            AscendAttentionState.SpecDecoding,
+            AscendAttentionState.ChunkedPrefill,
+        )
+        if attn_metadata.attn_state not in splitfuse_states:
             return attn_metadata
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
