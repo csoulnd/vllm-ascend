@@ -24,7 +24,10 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
     register_backend,
 )
 
-from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310, is_compressed_mask_supported
+from vllm_ascend._310p.attention.attention_mask import (
+    AttentionMaskBuilder310,
+    is_compressed_mask_supported,
+)
 from vllm_ascend._310p.attention.metadata_builder import AscendAttentionMetadataBuilder310
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -99,9 +102,25 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
     optimized for the Ascend 310P architecture.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.support_compressed_mask = is_compressed_mask_supported()
+
+    @staticmethod
+    def _get_query_lens_cpu(attn_metadata) -> torch.Tensor:
+        query_lens_cpu = getattr(attn_metadata, "query_lens_cpu", None)
+        if query_lens_cpu is not None:
+            return query_lens_cpu
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        if _EXTRA_CTX.capturing:
+            raise RuntimeError(
+                "310P splitfuse requires attn_metadata.query_lens_cpu during graph capture; "
+                "ensure AscendAttentionMetadataBuilder310.build() ran before forward."
+            )
+        # Eager-only fallback.
+        qsl_cpu = attn_metadata.query_start_loc.cpu()
+        return qsl_cpu[1:] - qsl_cpu[:-1]
 
     def _flash_attention(
         self,
@@ -243,18 +262,22 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         query = query[:num_actual_tokens]
         output = output[:num_actual_tokens]
 
-        # Calculate query lengths from start locations
-        qsl_cpu = attn_metadata.query_start_loc.cpu()
-        qlens = qsl_cpu[1:] - qsl_cpu[:-1]
+        # ATB splitfuse expects host qLens; filled in metadata build (graph-safe).
+        qlens = self._get_query_lens_cpu(attn_metadata)
 
-        context_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_tables
 
-        if context_lens.device != query.device:
-            context_lens = context_lens.to(query.device, non_blocking=True)
+        if attn_metadata.seq_lens.device != query.device:
+            attn_metadata.seq_lens = attn_metadata.seq_lens.to(
+                device=query.device,
+                non_blocking=True,
+            )
 
         if self.support_compressed_mask:
-            mask = AttentionMaskBuilder310.get_compressed_splitfuse_mask(query.device)
+            if attn_metadata.attn_mask is not None:
+                mask = attn_metadata.attn_mask
+            else:
+                mask = AttentionMaskBuilder310.get_compressed_splitfuse_mask(query.device)
             torch_npu._npu_paged_attention_splitfuse_v2(
                 query=query,
                 key_cache=self.key_cache,
@@ -262,7 +285,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
                 mask=mask,
                 block_table=block_table,
                 seq_len=qlens,
-                context_lens=context_lens,
+                context_lens=attn_metadata.seq_lens,
                 num_kv_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 scale_value=self.scale,
@@ -280,7 +303,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             mask=mask,
             block_table=block_table,
             seq_len=qlens,
-            context_lens=context_lens,
+            context_lens=attn_metadata.seq_lens,
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             scale_value=self.scale,
@@ -288,10 +311,6 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         )
 
         return output
-
-    def forward_spec_decoding_310(self, query, attn_metadata, output):
-        """Execute SpecDecoding on 310P using full query rows plus splitfuse mask."""
-        return self.forward_chunked_prefill_310(query, attn_metadata, output)
 
     def forward_impl(self, query, key, value, kv_cache, attn_metadata, output):
         """
@@ -325,9 +344,9 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         # Condition for PrefillCacheHit: Indicates prefill with some cached tokens already processed
         elif state in [AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit]:
             output = self.forward_chunked_prefill_310(query, attn_metadata, output)
-        # Condition for SpecDecoding: Specified for mtp, which is not supported yet.
+        # Condition for SpecDecoding: MTP spec verify (splitfuse v2 when compressed mask supported).
         elif state == AscendAttentionState.SpecDecoding:
-            output = self.forward_spec_decoding_310(query, attn_metadata, output)
+            output = self.forward_chunked_prefill_310(query, attn_metadata, output)
         else:
             raise NotImplementedError(f"AscendAttentionState: {state} is not supported for 310P currently.")
         return output
