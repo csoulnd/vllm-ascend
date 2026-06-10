@@ -29,7 +29,6 @@ if HAS_TRITON:
         import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa
 
 
-import vllm_ascend.patch.worker.patch_weight_utils  # noqa
 import vllm_ascend.patch.worker.patch_distributed  # noqa
 import vllm_ascend.patch.worker.patch_minimax_m2  # noqa
 import vllm_ascend.patch.worker.patch_minimax_m2_linear_attn  # noqa
@@ -42,6 +41,7 @@ if not is_310p():
     import vllm_ascend.patch.worker.patch_gdn_attn  # noqa
     import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa
     import vllm_ascend.patch.worker.patch_qwen3vl  # noqa
+    import vllm_ascend.patch.worker.patch_weight_utils  # noqa
 else:
     import vllm_ascend.patch.worker.patch_idex_310  # noqa
 import vllm_ascend.patch.worker.patch_rejection_sampler  # noqa
