@@ -132,15 +132,29 @@ def _flatten_state_indices(
     if ssm_state_indices.ndim == 1:
         return ssm_state_indices[:total_tokens].to(torch.int32).contiguous()
 
-    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    ssm_state_indices = ssm_state_indices[: seq_lens.shape[0]]
-    positions = torch.arange(
-        ssm_state_indices.shape[1],
-        device=ssm_state_indices.device,
-        dtype=seq_lens.dtype,
-    )
-    valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
-    return ssm_state_indices.masked_select(valid)[:total_tokens].to(torch.int32).contiguous()
+    num_seqs = (cu_seqlens[1:] - cu_seqlens[:-1]).shape[0]
+    seq_lens = cu_seqlens[1 : num_seqs + 1] - cu_seqlens[:num_seqs]
+    ssm_state_indices = ssm_state_indices[:num_seqs]
+
+    # Uniform spec-decode ACL graph uses fixed q_len per request; reshape avoids
+    # NPU masked_select which breaks stream capture (aclnnMaskedSelect / 107027).
+    if _EXTRA_CTX.capturing or (seq_lens.numel() > 0 and torch.all(seq_lens == seq_lens[0])):
+        q_per_seq = ssm_state_indices.shape[1]
+        flat = ssm_state_indices[:, :q_per_seq].reshape(-1)
+        return flat[:total_tokens].to(torch.int32).contiguous()
+
+    # Eager mixed batches with variable seq_lens: compact on CPU, copy back async.
+    ssm_cpu = ssm_state_indices.cpu()
+    seq_lens_cpu = seq_lens.cpu()
+    q_per_seq = ssm_cpu.shape[1]
+    positions = torch.arange(q_per_seq)
+    valid = positions.unsqueeze(0) < seq_lens_cpu.unsqueeze(1)
+    flat_cpu = ssm_cpu.masked_select(valid).to(torch.int32).contiguous()[:total_tokens]
+    if not flat_cpu.is_pinned:
+        flat_cpu = flat_cpu.pin_memory()
+    flat_dev = torch.empty(flat_cpu.numel(), dtype=torch.int32, device=ssm_state_indices.device)
+    flat_dev.copy_(flat_cpu, non_blocking=True)
+    return flat_dev.contiguous()
 
 
 def npu_recurrent_gated_delta_rule_310(
