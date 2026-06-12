@@ -297,6 +297,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
             spec_num_accepted = num_accepted_tokens[: attn_metadata.num_spec_decodes].to(torch.int64)
             uniform_spec_only = attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0
             if _EXTRA_CTX.capturing and uniform_spec_only:
+                # Graph capture: bind device buffers so replay can refresh them in-place.
                 qsl_dev, cidx_dev, nat_dev, qsl_buf, cidx_buf, nat_buf = _get_spec_causal_conv1d_device_args(
                     attn_metadata
                 )
@@ -318,33 +319,29 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     nat_dev=nat_buf,
                     q_per_seq=spec_q_per_seq,
                 )
-                mixed_qkv_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
-                    mixed_qkv_spec,
-                    conv_weights,
-                    bias=self.conv1d.bias,
-                    conv_states=conv_state,
-                    query_start_loc=qsl_dev,
-                    cache_indices=cidx_dev,
-                    initial_state_mode=None,
-                    num_accepted_tokens=nat_dev,
-                    activation_mode=activation_num,
-                    pad_slot_id=PAD_SLOT_ID,
-                    run_mode=1,
-                )
+                conv1d_query_start_loc = qsl_dev
+                conv1d_cache_indices = cidx_dev
+                conv1d_num_accepted = nat_dev
             else:
-                mixed_qkv_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
-                    mixed_qkv_spec,
-                    conv_weights,
-                    bias=self.conv1d.bias,
-                    conv_states=conv_state,
-                    query_start_loc=spec_query_start_loc.to(torch.int64),
-                    cache_indices=spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes].to(torch.int64),
-                    initial_state_mode=None,
-                    num_accepted_tokens=spec_num_accepted,
-                    activation_mode=activation_num,
-                    pad_slot_id=PAD_SLOT_ID,
-                    run_mode=1,
+                conv1d_query_start_loc = spec_query_start_loc.to(torch.int64)
+                conv1d_cache_indices = spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes].to(
+                    torch.int64
                 )
+                conv1d_num_accepted = spec_num_accepted
+
+            mixed_qkv_spec = torch.ops._C_ascend.npu_causal_conv1d_310(
+                mixed_qkv_spec,
+                conv_weights,
+                bias=self.conv1d.bias,
+                conv_states=conv_state,
+                query_start_loc=conv1d_query_start_loc,
+                cache_indices=conv1d_cache_indices,
+                initial_state_mode=None,
+                num_accepted_tokens=conv1d_num_accepted,
+                activation_mode=activation_num,
+                pad_slot_id=PAD_SLOT_ID,
+                run_mode=1,
+            )
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
