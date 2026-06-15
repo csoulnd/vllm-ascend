@@ -391,16 +391,6 @@ class NPUModelRunner310(NPUModelRunner):
         self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
-        if self.num_spec_tokens:
-            # NPU GatherV2 (token embedding) hard-faults on out-of-range ids.
-            # Async spec-decode placeholder/rejected drafts can be -1; those
-            # positions are dropped by the rejection sampler later, so clamping
-            # into [0, vocab) keeps results correct while avoiding invalid GM
-            # access on device.
-            vocab_size = self.model_config.get_vocab_size()
-            torch.clamp_(
-                self.input_ids.gpu[:total_num_scheduled_tokens], 0, vocab_size - 1
-            )
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
             self.mrope_positions.gpu.copy_(
