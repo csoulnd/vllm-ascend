@@ -103,6 +103,16 @@ class NPUModelRunner310(NPUModelRunner):
             self.cudagraph_dispatcher.uniform_decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN
             logger.info_once("Ngram speculative decoding uses uniform_decode_query_len=1 for graph capture.")
 
+    def _sync_before_async_spec_metadata_update(self) -> None:
+        """Wait for prior-step NPU work before async metadata correction.
+
+        Under async scheduling + batch queue, the next step's
+        ``update_num_computed_tokens_for_batch_change`` (Ge/And/Add on
+        ``num_computed_tokens``) can overlap the previous step's FULL graph
+        replay on another stream and corrupt shared runner buffers.
+        """
+        torch.npu.synchronize()
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred = super()._update_states(scheduler_output)
         if scheduler_output.finished_req_ids:
@@ -445,6 +455,11 @@ class NPUModelRunner310(NPUModelRunner):
             self.use_async_spec_decode and self.valid_sampled_token_count_gpu is not None and prev_req_id_to_index
         )
         if need_async_num_computed_update:
+            logger.info_once(
+                "310P async spec decode: synchronizing NPU before "
+                "num_computed_tokens/seq_lens metadata correction."
+            )
+            self._sync_before_async_spec_metadata_update()
             self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
