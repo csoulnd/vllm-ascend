@@ -63,6 +63,26 @@ def _fill_cpu_exponential_310p(
             q_cpu[i].exponential_(generator=cpu_gen)
 
 
+def generate_uniform_probs_310p(
+    num_tokens: int,
+    num_draft_tokens: list[int],
+    generators: dict[int, torch.Generator],
+) -> torch.Tensor:
+    """Generate uniform [0, 1) samples on CPU for 310P rejection sampling."""
+    uniform_probs = torch.rand((num_tokens,), dtype=torch.float64, device="cpu")
+    start_idx = 0
+    for req_idx, n in enumerate(num_draft_tokens):
+        if n == 0:
+            continue
+        end_idx = start_idx + n
+        generator = generators.get(req_idx)
+        if generator is not None:
+            cpu_gen = _get_cpu_generator_310p(req_idx, generator)
+            uniform_probs[start_idx:end_idx].uniform_(generator=cpu_gen)
+        start_idx = end_idx
+    return uniform_probs
+
+
 def fill_exponential_310p(
     q: torch.Tensor,
     generators: dict[int, torch.Generator],
