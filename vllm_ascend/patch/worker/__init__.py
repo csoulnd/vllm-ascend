@@ -50,6 +50,7 @@ if not is_310p():
         pass
     import vllm_ascend.patch.worker.patch_cudagraph  # noqa
 else:
+    import vllm_ascend.patch.worker.patch_cudagraph_310  # noqa
     import vllm_ascend.patch.worker.patch_idex_310  # noqa
 import vllm_ascend.patch.worker.patch_rejection_sampler  # noqa
 import vllm_ascend.patch.worker.patch_weight_utils  # noqa
