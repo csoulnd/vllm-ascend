@@ -31,6 +31,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -792,6 +793,34 @@ class NPUModelRunner310(NPUModelRunner):
         assert layer_names == set(kv_cache.keys()), "Some layers are not correctly initialized"
         return kv_cache
 
+    def _sync_input_ids_cpu_to_gpu(self, total_num_scheduled_tokens: int) -> None:
+        """Upload CPU input_ids with a blocking copy."""
+        self.input_ids.gpu[:total_num_scheduled_tokens].copy_(
+            self.input_ids.cpu[:total_num_scheduled_tokens],
+            non_blocking=False,
+        )
+
+    def _finalize_input_ids_cpu_layout(self, total_num_scheduled_tokens: int) -> None:
+        """Replace async spec placeholders before upload so GatherV2 never sees -1."""
+        cpu_ids = self.input_ids.cpu[:total_num_scheduled_tokens]
+        cpu_ids.masked_fill_(cpu_ids == PLACEHOLDER_TOKEN_ID, 0)
+
+    def _sanitize_placeholder_input_ids_for_forward(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_forward_tokens: int,
+    ) -> None:
+        super()._sanitize_placeholder_input_ids_for_forward(
+            scheduler_output,
+            num_forward_tokens,
+        )
+        # ACL graph replay forwards ``input_ids[:num_tokens_padded]``, but
+        # ``_prepare_inputs`` only uploads ``total_num_scheduled_tokens``. Tail
+        # slots keep capture-time garbage and fault in GatherV2 on 310P.
+        actual_tokens = scheduler_output.total_num_scheduled_tokens
+        if num_forward_tokens > actual_tokens:
+            self.input_ids.gpu[actual_tokens:num_forward_tokens].zero_()
+
     # Override this function because of tensor.copy_(other) accuracy issue.
     # TODO: This override will be removed after tensor.copy_(other) accuracy issue is resolved.
     def _prepare_input_ids(
@@ -809,7 +838,8 @@ class NPUModelRunner310(NPUModelRunner):
 
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
-            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            self._finalize_input_ids_cpu_layout(total_num_scheduled_tokens)
+            self._sync_input_ids_cpu_to_gpu(total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
@@ -826,14 +856,12 @@ class NPUModelRunner310(NPUModelRunner):
         prev_draft_token_indices: list[int] = []
         indices_match = True
         max_flattened_index = -1
-        total_num_spec_tokens = 0
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
 
         for req_id, cur_index in self.input_batch.req_id_to_index.items():
             if (prev_index := prev_req_id_to_index.get(req_id)) is not None:
                 prev_common_req_indices.append(prev_index)
                 draft_len = len(scheduled_spec_tokens.get(req_id, ()))
-                total_num_spec_tokens += draft_len
                 flattened_index = int(cu_num_tokens[cur_index]) - 1
                 sample_flattened_indices.append(flattened_index - draft_len)
                 spec_flattened_indices.extend(range(flattened_index - draft_len + 1, flattened_index + 1))
@@ -842,50 +870,54 @@ class NPUModelRunner310(NPUModelRunner):
                 indices_match &= prev_index == flattened_index
                 max_flattened_index = max(max_flattened_index, flattened_index)
         num_common_tokens = len(sample_flattened_indices)
-        total_without_spec = total_num_scheduled_tokens - total_num_spec_tokens
-        if num_common_tokens < total_without_spec:
-            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+
+        # Upload the full CPU layout first so unscattered GPU slots are not stale.
+        self._finalize_input_ids_cpu_layout(total_num_scheduled_tokens)
+        self._sync_input_ids_cpu_to_gpu(total_num_scheduled_tokens)
+
+        if num_common_tokens == 0:
             if self.enable_prompt_embeds:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
-        if num_common_tokens == 0:
             return
+
+        prev_sampled = self.input_batch.prev_sampled_token_ids
         if indices_match and max_flattened_index == (num_common_tokens - 1):
-            # NOTE: Override the copy_ function here
             indices = torch.arange(num_common_tokens, device=self.input_ids.gpu.device)
-            source = self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0]
-            self.input_ids.gpu.index_copy_(0, indices, source)
+            self.input_ids.gpu.index_copy_(0, indices, prev_sampled[:num_common_tokens, 0])
             if self.enable_prompt_embeds:
                 self.is_token_ids.gpu[:num_common_tokens] = True
-            return
-        # Upload the index tensors asynchronously so the scatter can be non-blocking.
-        sampled_tokens_index_tensor = torch.tensor(
-            sample_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_common_req_indices_tensor = torch.tensor(
-            prev_common_req_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        self.input_ids.gpu.scatter_(
-            dim=0,
-            index=sampled_tokens_index_tensor,
-            src=self.input_batch.prev_sampled_token_ids[prev_common_req_indices_tensor, 0],
-        )
-        # Scatter the draft tokens after the sampled tokens are scattered.
-        if self._draft_token_ids is None or not spec_flattened_indices:
-            return
-        assert isinstance(self._draft_token_ids, torch.Tensor)
-        draft_tokens_index_tensor = torch.tensor(
-            spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_draft_token_indices_tensor = torch.tensor(
-            prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
-        self.input_ids.gpu.scatter_(
-            dim=0,
-            index=draft_tokens_index_tensor,
-            src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
-        )
+        else:
+            sampled_tokens_index_tensor = torch.tensor(
+                sample_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
+            prev_common_req_indices_tensor = torch.tensor(
+                prev_common_req_indices, dtype=torch.int64, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
+            self.input_ids.gpu.scatter_(
+                dim=0,
+                index=sampled_tokens_index_tensor,
+                src=prev_sampled[prev_common_req_indices_tensor, 0],
+            )
+
+        if self._draft_token_ids is not None and spec_flattened_indices:
+            assert isinstance(self._draft_token_ids, torch.Tensor)
+            draft_tokens_index_tensor = torch.tensor(
+                spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
+            prev_draft_token_indices_tensor = torch.tensor(
+                prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
+            draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
+            self.input_ids.gpu.scatter_(
+                dim=0,
+                index=draft_tokens_index_tensor,
+                src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+            )
+
+        if self.enable_prompt_embeds:
+            self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+            self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
 
     def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
         """
