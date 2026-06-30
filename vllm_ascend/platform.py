@@ -622,6 +622,32 @@ class NPUPlatform(Platform):
             # We don't want to have our FX graph split for the sake of static kernel feature,
             # because it will compile multiple times, so we set splitting_ops to empty manually.
             compilation_config.splitting_ops = []
+            # 310P uniform spec-decode dispatches a per-batch FULL graph keyed by
+            # num_tokens = num_reqs * (1 + num_speculative_tokens). If a running
+            # batch size is not captured, the dispatcher pads up to a larger
+            # captured graph and injects dummy requests (PAD_SLOT_ID); the 310P
+            # GDN conv1d kernel mishandles those dummies, causing "model stream
+            # execute failed" (507011) and garbled tokens. Densify the capture
+            # sizes so every reachable uniform spec-decode batch (1..max_num_seqs)
+            # maps to an exactly-captured graph, eliminating padding / dummies.
+            if is_310p() and vllm_config.speculative_config is not None:
+                uniform_decode_query_len = 1 + vllm_config.speculative_config.num_speculative_tokens
+                max_capture_size = compilation_config.max_cudagraph_capture_size or 0
+                max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+                dense_sizes = [
+                    num_reqs * uniform_decode_query_len
+                    for num_reqs in range(1, max_num_seqs + 1)
+                    if num_reqs * uniform_decode_query_len <= max_capture_size
+                ]
+                current_sizes = sorted(compilation_config.cudagraph_capture_sizes or [])
+                merged_sizes = sorted(set(current_sizes) | set(dense_sizes))
+                if merged_sizes and merged_sizes != current_sizes:
+                    update_cudagraph_capture_sizes(vllm_config, merged_sizes)
+                    logger.info(
+                        "310P spec-decode: densified ACL graph capture sizes to %s to avoid "
+                        "uniform-decode padding (PAD_SLOT_ID dummy) graphs.",
+                        merged_sizes,
+                    )
         else:
             logger.info(
                 "%s cudagraph_mode is not support on NPU. falling back to NONE", compilation_config.cudagraph_mode

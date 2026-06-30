@@ -53,7 +53,7 @@ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
-from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
+from vllm_ascend.utils import enable_sp, is_310p, lmhead_tp_enable, shared_expert_dp_enabled
 
 
 @contextmanager
@@ -971,7 +971,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             }
             run_draft = partial(self._runnable, **model_inputs)
 
-            if self.enable_enpu:
+            # 310P draft uses a fixed-buffer ACL graph replay contract: the
+            # conv1d / attention graph params (cache_indices, query_start_loc,
+            # ...) must be written into the captured fixed buffers BEFORE replay,
+            # exactly like the ENPU graph_task_update path. Without this, a
+            # batch=2 uniform spec-decode draft replay reads stale / capture-time
+            # buffers, mismatching the two real requests' GDN conv_state indices
+            # and triggering an aicore exception. (Eager / non-uniform draft runs
+            # _forward_core directly and is unaffected, which is why variable-len
+            # accuracy runs pass while fixed-len uniform perf runs crash.)
+            if self.enable_enpu or is_310p():
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
                 draft_token_ids = run_draft()
             else:
