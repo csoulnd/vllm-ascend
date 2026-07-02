@@ -54,7 +54,7 @@ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
-from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
+from vllm_ascend.utils import enable_sp, is_310p, lmhead_tp_enable, shared_expert_dp_enabled
 
 
 @contextmanager
@@ -729,6 +729,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
 
+    def _should_update_310p_mtp_full_graph_before_replay(
+        self,
+        forward_context: ForwardContext,
+    ) -> bool:
+        return (
+            is_310p()
+            and self.method == "mtp"
+            and self.use_cuda_graph
+            and not self.enable_enpu
+            and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and hasattr(self, "update_stream")
+        )
+
     def _propose(
         self,
         # [num_tokens]
@@ -1067,8 +1080,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             }
             run_draft = partial(self._runnable, **model_inputs)
 
-            if self.enable_enpu:
+            update_310p_before_replay = self._should_update_310p_mtp_full_graph_before_replay(forward_context)
+            if self.enable_enpu or update_310p_before_replay:
+                if update_310p_before_replay:
+                    torch.npu.current_stream().synchronize()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+                if update_310p_before_replay:
+                    torch.npu.current_stream().wait_stream(self.update_stream)
                 draft_token_ids = run_draft()
             else:
                 draft_token_ids = run_draft()
