@@ -1567,6 +1567,27 @@ class NPUModelRunner(GPUModelRunner):
         input_ids = self.input_ids.gpu[:num_forward_tokens]
         input_ids.masked_fill_(input_ids == PLACEHOLDER_TOKEN_ID, 0)
 
+    def _sanitize_padded_forward_inputs(
+        self,
+        num_actual_tokens: int,
+        num_forward_tokens: int,
+    ) -> None:
+        """Initialize graph padding tokens so replay never consumes stale data."""
+        if num_forward_tokens <= num_actual_tokens:
+            return
+
+        pad_tokens = slice(num_actual_tokens, num_forward_tokens)
+        self.input_ids.gpu[pad_tokens].fill_(0)
+        self.positions[pad_tokens].fill_(0)
+        if self.uses_mrope:
+            self.mrope_positions.gpu[:, pad_tokens].fill_(0)
+        elif self.uses_xdrope_dim > 0:
+            self.xdrope_positions.gpu[:, pad_tokens].fill_(0)
+
+        if self.enable_prompt_embeds:
+            self.inputs_embeds.gpu[pad_tokens].zero_()
+            self.is_token_ids.gpu[pad_tokens].fill_(True)
+
     def _calc_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
@@ -2232,11 +2253,24 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
                 )
 
+                use_pcp_hybrid_forward_tokens = self.use_cp and self.pcp_manager.pcp_use_hybrid_attn
+                num_forward_tokens_for_sanitize = (
+                    total_num_scheduled_tokens
+                    if use_pcp_hybrid_forward_tokens
+                    else num_tokens_padded
+                )
+                num_forward_actual_tokens = (
+                    total_num_scheduled_tokens
+                    if use_pcp_hybrid_forward_tokens
+                    else num_tokens_unpadded
+                )
+                self._sanitize_padded_forward_inputs(
+                    num_forward_actual_tokens,
+                    num_forward_tokens_for_sanitize,
+                )
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
-                    num_tokens_padded
-                    if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
-                    else total_num_scheduled_tokens,
+                    num_forward_tokens_for_sanitize,
                 )
 
             (
@@ -2819,6 +2853,20 @@ class NPUModelRunner(GPUModelRunner):
                 positions.shape[0],
             )
 
+    def _should_update_310p_mtp_full_graph_before_replay(
+        self,
+        forward_context: ForwardContext,
+    ) -> bool:
+        return (
+            get_ascend_device_type() == AscendDeviceType._310P
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and not self.enable_enpu
+            and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not forward_context.capturing
+            and hasattr(self, "update_stream")
+        )
+
     def _model_forward(
         self,
         num_tokens_padded: int,
@@ -2841,11 +2889,20 @@ class NPUModelRunner(GPUModelRunner):
         }
         run_model = partial(self.model, **model_inputs)
 
-        if self.enable_enpu:
+        update_310p_before_replay = (
+            self._should_update_310p_mtp_full_graph_before_replay(
+                forward_context
+            )
+        )
+        if self.enable_enpu or update_310p_before_replay:
             # The soft segmentation scenario requires event.record first, then event.wait
+            if update_310p_before_replay:
+                torch.npu.current_stream().synchronize()
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions
             )
+            if update_310p_before_replay:
+                torch.npu.current_stream().wait_stream(self.update_stream)
             hidden_states = run_model()
         else:
             hidden_states = run_model()
@@ -3261,8 +3318,12 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 # NOTE(zxr): Due to the Triton operator does not deal with -1 padding in FullGraph mode,
                 # the padding needs to be changed from -1 to 0 to avoid writing invalid mamba block.
-                if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() \
-                    and isinstance(builder, GDNAttentionMetadataBuilder) and attn_metadata_i.num_prefills == 0:
+                if (
+                    self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+                    and get_ascend_device_type() != AscendDeviceType._310P
+                    and isinstance(builder, GDNAttentionMetadataBuilder)
+                    and attn_metadata_i.num_prefills == 0
+                ):
                     if attn_metadata_i.num_decodes == 0 and attn_metadata_i.num_spec_decodes > 0:
                         attn_metadata_i.spec_state_indices_tensor[attn_metadata_i.num_spec_decodes:].fill_(0)
             if isinstance(builder, AscendDSAMetadataBuilder):
