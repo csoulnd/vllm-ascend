@@ -53,7 +53,7 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
             num_tokens = target_token_ids.shape[0]
 
             # Protected shift (310P specific)
-            tail_save = self.input_ids[num_tokens - 1].item()
+            tail_save = self.input_ids[num_tokens - 1].clone()
             self.input_ids[: num_tokens - 1] = target_token_ids[1:]
             self.input_ids[num_tokens - 1] = tail_save
 
