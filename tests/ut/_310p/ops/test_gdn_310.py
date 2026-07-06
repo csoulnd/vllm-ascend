@@ -26,6 +26,7 @@ from vllm_ascend._310p.ops.fla.gdn_310 import (
     _pad_spec_conv1d_host_args_shape_consistent_dummy_310p,
     _zero_padded_tokens,
     has_310p_gdn_buffer_replay_params,
+    update_conv1d_graph_params_310p,
 )
 from vllm_ascend._310p.ops.gdn_attn_builder_310 import (
     AscendGDNAttentionBackend310,
@@ -92,6 +93,79 @@ def test_has_310p_gdn_buffer_replay_params_ignores_non_spec_replay(monkeypatch):
     )
 
     assert not has_310p_gdn_buffer_replay_params(8)
+
+
+def test_update_conv1d_graph_params_reuses_host_args_per_layer(monkeypatch):
+    params = []
+    for _ in range(2):
+        params.append(
+            (
+                None,
+                torch.empty(8, 1),
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                "spec",
+                "layer",
+                torch.empty(3, dtype=torch.int64),
+                torch.empty(2, dtype=torch.int64),
+                torch.empty(2, dtype=torch.int64),
+                4,
+                "310",
+                "buffer_replay",
+            )
+        )
+    graph_params = SimpleNamespace(conv1d_params={8: params})
+    metadata = SimpleNamespace(spec_sequence_masks=torch.tensor([True]))
+    calls = {"host": 0, "pad": 0, "copy": 0}
+
+    class NullStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_host_args(meta):
+        calls["host"] += 1
+        return (0, 4), (11,), (2,)
+
+    def fake_pad_args(qsl_host, cidx_host, accepted_host, cap_x_dim0, q_per_seq):
+        calls["pad"] += 1
+        assert (qsl_host, cidx_host, accepted_host) == ((0, 4), (11,), (2,))
+        assert (cap_x_dim0, q_per_seq) == (8, 4)
+        return (0, 4, 8), (11, PAD_SLOT_ID), (2, 0)
+
+    def fake_copy(buffer, host_tuple):
+        calls["copy"] += 1
+
+    monkeypatch.setattr("vllm_ascend._310p.ops.fla.gdn_310.get_graph_params", lambda: graph_params)
+    monkeypatch.setattr("vllm_ascend._310p.ops.fla.gdn_310.torch.npu.stream", lambda stream: NullStream())
+    monkeypatch.setattr("vllm_ascend._310p.ops.fla.gdn_310.GDNAttentionMetadata", SimpleNamespace)
+    monkeypatch.setattr(
+        "vllm_ascend._310p.ops.fla.gdn_310._get_spec_causal_conv1d_update_host_args_310p",
+        fake_host_args,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend._310p.ops.fla.gdn_310._pad_spec_conv1d_host_args_shape_consistent_dummy_310p",
+        fake_pad_args,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend._310p.ops.fla.gdn_310._copy_host_tuple_to_int64_buffer",
+        fake_copy,
+    )
+
+    update_conv1d_graph_params_310p(
+        update_stream=object(),
+        forward_context=SimpleNamespace(attn_metadata={"layer": metadata}),
+        num_tokens=8,
+        vllm_config=None,
+    )
+
+    assert calls == {"host": 1, "pad": 1, "copy": 6}
 
 
 def test_zero_padded_tokens_masks_only_padded_token_positions():

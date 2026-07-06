@@ -641,6 +641,12 @@ def update_conv1d_graph_params_310p(
     if is_draft_model and draft_attn_metadatas is not None:
         attn_metadata = draft_attn_metadatas
 
+    host_args_cache: dict[str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None] = {}
+    padded_args_cache: dict[
+        tuple[str, int, int],
+        tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]],
+    ] = {}
+
     with torch.npu.stream(update_stream):
         for param in graph_params.conv1d_params[num_tokens]:
             param_list = list(param)
@@ -671,25 +677,32 @@ def update_conv1d_graph_params_310p(
             if run_mode != 1 or branch != "spec" or attn_metadata is None:
                 continue
 
-            meta = attn_metadata
-            if isinstance(meta, dict):
-                meta = meta.get(layer_prefix, None)
-            if not isinstance(meta, GDNAttentionMetadata):
-                continue
-            if meta.spec_sequence_masks is None:
+            if layer_prefix not in host_args_cache:
+                meta = attn_metadata
+                if isinstance(meta, dict):
+                    meta = meta.get(layer_prefix, None)
+                if not isinstance(meta, GDNAttentionMetadata) or meta.spec_sequence_masks is None:
+                    host_args_cache[layer_prefix] = None
+                else:
+                    host_args_cache[layer_prefix] = _get_spec_causal_conv1d_update_host_args_310p(meta)
+            host_args = host_args_cache[layer_prefix]
+            if host_args is None:
                 continue
 
             cap_x_dim0 = int(mixed_qkv.size(0))
-            qsl_host, cidx_host, num_accepted_host = _get_spec_causal_conv1d_update_host_args_310p(meta)
-            new_query_start_loc, new_cache_indices, new_num_accepted = (
-                _pad_spec_conv1d_host_args_shape_consistent_dummy_310p(
-                    qsl_host,
-                    cidx_host,
-                    num_accepted_host,
-                    cap_x_dim0=cap_x_dim0,
-                    q_per_seq=q_per_seq,
+            cache_key = (layer_prefix, cap_x_dim0, q_per_seq)
+            if cache_key not in padded_args_cache:
+                qsl_host, cidx_host, num_accepted_host = host_args
+                padded_args_cache[cache_key] = (
+                    _pad_spec_conv1d_host_args_shape_consistent_dummy_310p(
+                        qsl_host,
+                        cidx_host,
+                        num_accepted_host,
+                        cap_x_dim0=cap_x_dim0,
+                        q_per_seq=q_per_seq,
+                    )
                 )
-            )
+            new_query_start_loc, new_cache_indices, new_num_accepted = padded_args_cache[cache_key]
             _copy_host_tuple_to_int64_buffer(qsl_dev, new_query_start_loc)
             _copy_host_tuple_to_int64_buffer(cidx_dev, new_cache_indices)
             if nat_dev is not None:
