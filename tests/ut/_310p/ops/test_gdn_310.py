@@ -95,9 +95,9 @@ def test_has_310p_gdn_buffer_replay_params_ignores_non_spec_replay(monkeypatch):
     assert not has_310p_gdn_buffer_replay_params(8)
 
 
-def test_update_conv1d_graph_params_reuses_host_args_per_layer(monkeypatch):
+def test_update_conv1d_graph_params_reuses_host_args_across_layers(monkeypatch):
     params = []
-    for _ in range(2):
+    for layer_prefix in ("layer.0", "layer.1"):
         params.append(
             (
                 None,
@@ -109,7 +109,7 @@ def test_update_conv1d_graph_params_reuses_host_args_per_layer(monkeypatch):
                 None,
                 1,
                 "spec",
-                "layer",
+                layer_prefix,
                 torch.empty(3, dtype=torch.int64),
                 torch.empty(2, dtype=torch.int64),
                 torch.empty(2, dtype=torch.int64),
@@ -120,6 +120,7 @@ def test_update_conv1d_graph_params_reuses_host_args_per_layer(monkeypatch):
         )
     graph_params = SimpleNamespace(conv1d_params={8: params})
     metadata = SimpleNamespace(spec_sequence_masks=torch.tensor([True]))
+    attn_metadata = {"layer.0": metadata, "layer.1": metadata}
     calls = {"host": 0, "pad": 0, "copy": 0}
 
     class NullStream:
@@ -160,7 +161,7 @@ def test_update_conv1d_graph_params_reuses_host_args_per_layer(monkeypatch):
 
     update_conv1d_graph_params_310p(
         update_stream=object(),
-        forward_context=SimpleNamespace(attn_metadata={"layer": metadata}),
+        forward_context=SimpleNamespace(attn_metadata=attn_metadata),
         num_tokens=8,
         vllm_config=None,
     )

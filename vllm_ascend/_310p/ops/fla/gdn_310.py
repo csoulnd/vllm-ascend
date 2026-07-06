@@ -641,9 +641,9 @@ def update_conv1d_graph_params_310p(
     if is_draft_model and draft_attn_metadatas is not None:
         attn_metadata = draft_attn_metadatas
 
-    host_args_cache: dict[str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None] = {}
+    shared_host_args: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None = None
     padded_args_cache: dict[
-        tuple[str, int, int],
+        tuple[int, int],
         tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]],
     ] = {}
 
@@ -677,22 +677,18 @@ def update_conv1d_graph_params_310p(
             if run_mode != 1 or branch != "spec" or attn_metadata is None:
                 continue
 
-            if layer_prefix not in host_args_cache:
-                meta = attn_metadata
-                if isinstance(meta, dict):
-                    meta = meta.get(layer_prefix, None)
-                if not isinstance(meta, GDNAttentionMetadata) or meta.spec_sequence_masks is None:
-                    host_args_cache[layer_prefix] = None
-                else:
-                    host_args_cache[layer_prefix] = _get_spec_causal_conv1d_update_host_args_310p(meta)
-            host_args = host_args_cache[layer_prefix]
-            if host_args is None:
+            meta = attn_metadata
+            if isinstance(meta, dict):
+                meta = meta.get(layer_prefix, None)
+            if not isinstance(meta, GDNAttentionMetadata) or meta.spec_sequence_masks is None:
                 continue
+            if shared_host_args is None:
+                shared_host_args = _get_spec_causal_conv1d_update_host_args_310p(meta)
 
             cap_x_dim0 = int(mixed_qkv.size(0))
-            cache_key = (layer_prefix, cap_x_dim0, q_per_seq)
+            cache_key = (cap_x_dim0, q_per_seq)
             if cache_key not in padded_args_cache:
-                qsl_host, cidx_host, num_accepted_host = host_args
+                qsl_host, cidx_host, num_accepted_host = shared_host_args
                 padded_args_cache[cache_key] = (
                     _pad_spec_conv1d_host_args_shape_consistent_dummy_310p(
                         qsl_host,
