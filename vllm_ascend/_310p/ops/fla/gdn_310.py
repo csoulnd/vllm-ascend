@@ -608,12 +608,10 @@ def _pad_spec_conv1d_host_args_shape_consistent_dummy_310p(
         return qsl_host, cidx_host, num_accepted_host
 
     full_pad_seqs, remainder = divmod(pad_tokens, q_per_seq)
-    next_qsl = runtime_qsl_last
-    for _ in range(full_pad_seqs):
-        next_qsl += q_per_seq
-        qsl_host = qsl_host + (next_qsl,)
-        cidx_host = cidx_host + (PAD_SLOT_ID,)
-        num_accepted_host = num_accepted_host + (0,)
+    if full_pad_seqs > 0:
+        qsl_host = qsl_host + tuple(runtime_qsl_last + (idx + 1) * q_per_seq for idx in range(full_pad_seqs))
+        cidx_host = cidx_host + (PAD_SLOT_ID,) * full_pad_seqs
+        num_accepted_host = num_accepted_host + (0,) * full_pad_seqs
     if remainder > 0:
         qsl_host = qsl_host + (cap_x_dim0,)
         cidx_host = cidx_host + (PAD_SLOT_ID,)

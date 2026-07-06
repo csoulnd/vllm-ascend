@@ -130,6 +130,34 @@ def test_pad_spec_conv1d_host_args_adds_shape_consistent_dummy_requests():
     assert accepted_host == (2, 0, 0, 0)
 
 
+def test_pad_spec_conv1d_host_args_keeps_capture_sized_metadata():
+    qsl_host, cidx_host, accepted_host = _pad_spec_conv1d_host_args_shape_consistent_dummy_310p(
+        qsl_host=(0, 4, 8),
+        cidx_host=(11, 12),
+        num_accepted_host=(2, 3),
+        cap_x_dim0=8,
+        q_per_seq=4,
+    )
+
+    assert qsl_host == (0, 4, 8)
+    assert cidx_host == (11, 12)
+    assert accepted_host == (2, 3)
+
+
+def test_pad_spec_conv1d_host_args_keeps_invalid_stride_metadata():
+    qsl_host, cidx_host, accepted_host = _pad_spec_conv1d_host_args_shape_consistent_dummy_310p(
+        qsl_host=(0, 4, 8),
+        cidx_host=(11,),
+        num_accepted_host=(2,),
+        cap_x_dim0=14,
+        q_per_seq=0,
+    )
+
+    assert qsl_host == (0, 4, 8)
+    assert cidx_host == (11, PAD_SLOT_ID)
+    assert accepted_host == (2, 0)
+
+
 def test_builder310_pads_spec_decode_metadata_with_dummy_requests():
     builder = object.__new__(AscendGDNAttentionMetadataBuilder310)
     builder.spec_state_indices_tensor = torch.full((4, 2), -1, dtype=torch.int32)
