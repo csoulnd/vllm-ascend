@@ -76,9 +76,15 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
         flash_comm_v1_enabled=False,
     )
 
-    with patch(
-        "vllm_ascend._310p.model_runner_310p.get_forward_context",
-        return_value=forward_context,
+    with (
+        patch(
+            "vllm_ascend._310p.model_runner_310p.get_forward_context",
+            return_value=forward_context,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p.has_310p_gdn_buffer_replay_params",
+            return_value=True,
+        ),
     ):
         hidden_states = runner._model_forward(
             8,
@@ -87,6 +93,51 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
         )
 
     assert calls == ["update", "model"]
+    torch.testing.assert_close(hidden_states, torch.ones(1))
+
+
+def test_model_forward_keeps_default_update_order_without_gdn_replay() -> None:
+    runner = object.__new__(NPUModelRunner310)
+    runner.uses_mrope = False
+    runner.enable_enpu = False
+    runner.speculative_config = SimpleNamespace(method="mtp")
+    runner.update_stream = MagicMock()
+    runner._all_gather_hidden_states_and_aux = MagicMock()
+
+    calls = []
+
+    def fake_update(*args):
+        calls.append("update")
+
+    def fake_model(**kwargs):
+        calls.append("model")
+        return torch.ones(1)
+
+    runner.model = fake_model
+    runner._update_full_graph_params_if_needed = fake_update
+    forward_context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        capturing=False,
+        flash_comm_v1_enabled=False,
+    )
+
+    with (
+        patch(
+            "vllm_ascend._310p.model_runner_310p.get_forward_context",
+            return_value=forward_context,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p.has_310p_gdn_buffer_replay_params",
+            return_value=False,
+        ),
+    ):
+        hidden_states = runner._model_forward(
+            8,
+            input_ids=torch.tensor([1]),
+            positions=torch.tensor([0]),
+        )
+
+    assert calls == ["model", "update"]
     torch.testing.assert_close(hidden_states, torch.ones(1))
 
 

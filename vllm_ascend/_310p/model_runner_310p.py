@@ -48,6 +48,7 @@ from vllm.v1.worker.cp_utils import get_total_cp_world_size
 from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
 from vllm_ascend._310p.kv_block_zeroer import AscendKVBlockZeroer310
 from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
+from vllm_ascend._310p.ops.fla.gdn_310 import has_310p_gdn_buffer_replay_params
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
@@ -681,6 +682,7 @@ class NPUModelRunner310(NPUModelRunner):
             and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
             and not forward_context.capturing
             and hasattr(self, "update_stream")
+            and has_310p_gdn_buffer_replay_params(num_tokens_padded)
         )
 
         if self.enable_enpu or update_before_replay:

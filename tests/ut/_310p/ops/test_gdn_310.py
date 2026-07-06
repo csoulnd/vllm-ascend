@@ -25,6 +25,7 @@ from vllm_ascend._310p.ops.fla.gdn_310 import (
     _mask_padded_recurrent_accepted_tokens,
     _pad_spec_conv1d_host_args_shape_consistent_dummy_310p,
     _zero_padded_tokens,
+    has_310p_gdn_buffer_replay_params,
 )
 from vllm_ascend._310p.ops.gdn_attn_builder_310 import (
     AscendGDNAttentionBackend310,
@@ -35,6 +36,62 @@ from vllm_ascend._310p.ops.gdn_attn_builder_310 import (
 def test_ascend_gdn_attention_310_uses_310p_backend():
     assert AscendGatedDeltaNetAttention310.get_attn_backend(object()) is AscendGDNAttentionBackend310
     assert AscendGDNAttentionBackend310.get_builder_cls() is AscendGDNAttentionMetadataBuilder310
+
+
+def test_has_310p_gdn_buffer_replay_params_detects_spec_replay(monkeypatch):
+    replay_param = (
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1,
+        "spec",
+        "layer",
+        None,
+        None,
+        None,
+        4,
+        "310",
+        "buffer_replay",
+    )
+    graph_params = SimpleNamespace(conv1d_params={8: [replay_param]})
+    monkeypatch.setattr(
+        "vllm_ascend._310p.ops.fla.gdn_310.get_graph_params",
+        lambda: graph_params,
+    )
+
+    assert has_310p_gdn_buffer_replay_params(8)
+
+
+def test_has_310p_gdn_buffer_replay_params_ignores_non_spec_replay(monkeypatch):
+    non_spec_param = (
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1,
+        "non_spec_decode",
+        "layer",
+        None,
+        None,
+        None,
+        1,
+        "310",
+        "buffer_replay",
+    )
+    graph_params = SimpleNamespace(conv1d_params={8: [non_spec_param]})
+    monkeypatch.setattr(
+        "vllm_ascend._310p.ops.fla.gdn_310.get_graph_params",
+        lambda: graph_params,
+    )
+
+    assert not has_310p_gdn_buffer_replay_params(8)
 
 
 def test_zero_padded_tokens_masks_only_padded_token_positions():

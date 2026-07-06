@@ -134,6 +134,32 @@ def _register_310_conv1d_buffer_replay(
     graph_params.conv1d_events[num_actual_tokens].append(None)
 
 
+def has_310p_gdn_buffer_replay_params(
+    num_tokens: int,
+    *,
+    is_draft_model: bool = False,
+) -> bool:
+    graph_params = get_draft_graph_params() if is_draft_model else get_graph_params()
+    if graph_params is None or num_tokens not in graph_params.conv1d_params:
+        return False
+
+    for param in graph_params.conv1d_params[num_tokens]:
+        if len(param) < 16:
+            continue
+        run_mode = param[7]
+        branch = param[8]
+        op_backend = param[14]
+        replay_mode = param[15]
+        if (
+            run_mode == 1
+            and branch == "spec"
+            and op_backend == _CONV1D_310_OP_BACKEND
+            and replay_mode == _CONV1D_310_BUFFER_REPLAY
+        ):
+            return True
+    return False
+
+
 def _flatten_state_indices(
     ssm_state_indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
