@@ -51,6 +51,7 @@ from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.utils import (
     update_num_computed_tokens_for_batch_change,
@@ -107,6 +108,8 @@ class NPUModelRunner310(NPUModelRunner):
             # Keep dispatcher's internal query_len in sync to avoid key-init assert.
             self.cudagraph_dispatcher.uniform_decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN
             logger.info_once("Ngram speculative decoding uses uniform_decode_query_len=1 for graph capture.")
+        self._mtp_draft_probs: torch.Tensor | None = None
+        self._mtp_draft_probs_req_ids: list[str] | None = None
 
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred = super()._update_states(scheduler_output)
@@ -243,6 +246,75 @@ class NPUModelRunner310(NPUModelRunner):
             attn_state = AscendAttentionState.SpecDecoding
             self.attn_state = attn_state
         return attn_state
+
+    def _get_mtp_draft_probs(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+    ) -> torch.Tensor | None:
+        draft_probs = self._mtp_draft_probs
+        draft_probs_req_ids = self._mtp_draft_probs_req_ids
+        if draft_probs is None or draft_probs_req_ids is None:
+            return None
+        if draft_probs.ndim != 3:
+            return None
+
+        req_id_to_prev_idx = {req_id: idx for idx, req_id in enumerate(draft_probs_req_ids)}
+        draft_prob_pieces: list[torch.Tensor] = []
+        for req_id, num_draft_tokens in zip(
+            self.input_batch.req_ids,
+            spec_decode_metadata.num_draft_tokens,
+            strict=True,
+        ):
+            if num_draft_tokens <= 0:
+                continue
+            prev_idx = req_id_to_prev_idx.get(req_id)
+            if prev_idx is None or prev_idx >= draft_probs.shape[0]:
+                return None
+            if num_draft_tokens > draft_probs.shape[1]:
+                return None
+            draft_prob_pieces.append(draft_probs[prev_idx, :num_draft_tokens])
+
+        if not draft_prob_pieces:
+            return None
+        return torch.cat(draft_prob_pieces, dim=0).contiguous()
+
+    def _sample(self, logits, spec_decode_metadata):
+        self.input_batch.update_async_output_token_ids()
+        sampling_metadata = self.input_batch.sampling_metadata
+        if spec_decode_metadata is None:
+            if lmhead_tp_enable() and logits is not None:
+                logits = logits[: self.input_batch.num_reqs]
+            if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
+                max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
+                self.sampler.prepare_sampling(max_topk)
+            return self.sampler(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+
+        if lmhead_tp_enable() and logits is not None:
+            logits = logits[: len(spec_decode_metadata.logits_indices)]
+        if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
+            max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
+            self.rejection_sampler.prepare_sampling(max_topk)
+        sampler_output = self.rejection_sampler(
+            spec_decode_metadata,
+            self._get_mtp_draft_probs(spec_decode_metadata),
+            logits,
+            sampling_metadata,
+        )
+        return sampler_output
+
+    def propose_draft_token_ids(self, *args, **kwargs):
+        draft_token_ids = super().propose_draft_token_ids(*args, **kwargs)
+        draft_probs = getattr(self.drafter, "_last_draft_probs", None)
+        if draft_probs is None:
+            self._mtp_draft_probs = None
+            self._mtp_draft_probs_req_ids = None
+        else:
+            self._mtp_draft_probs = draft_probs
+            self._mtp_draft_probs_req_ids = self.input_batch.req_ids.copy()
+        return draft_token_ids
 
     def _prepare_inputs(  # type: ignore[override]
         self,
