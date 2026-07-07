@@ -23,7 +23,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 import vllm_ascend.sample.rejection_sampler as rejection_sampler_module
-from vllm_ascend._310p.sample.sampler import fill_exponential_310p
+from vllm_ascend._310p.sample.sampler import (
+    fill_exponential_310p,
+    generate_uniform_probs_310p,
+)
 from vllm_ascend.sample.rejection_sampler import (
     AscendRejectionSampler,
     sample_recovered_tokens_blockwise_pytorch,
@@ -32,13 +35,16 @@ from vllm_ascend.sample.rejection_sampler import (
 
 
 @contextmanager
-def _bind_sample_recovered_tokens(fn):
+def _bind_310p_rejection_sampling(fn):
     original = rejection_sampler_module.sample_recovered_tokens
+    original_uniform = rejection_sampler_module.generate_uniform_probs
     rejection_sampler_module.sample_recovered_tokens = fn
+    rejection_sampler_module.generate_uniform_probs = generate_uniform_probs_310p
     try:
         yield
     finally:
         rejection_sampler_module.sample_recovered_tokens = original
+        rejection_sampler_module.generate_uniform_probs = original_uniform
 
 
 class AscendRejectionSampler310(AscendRejectionSampler):
@@ -51,7 +57,7 @@ class AscendRejectionSampler310(AscendRejectionSampler):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> SamplerOutput:
-        with _bind_sample_recovered_tokens(self.sample_recovered_tokens):
+        with _bind_310p_rejection_sampling(self.sample_recovered_tokens):
             return super().forward(metadata, draft_probs, logits, sampling_metadata)
 
     def sample_recovered_tokens(
