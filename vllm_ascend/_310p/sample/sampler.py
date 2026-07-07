@@ -26,19 +26,19 @@ from vllm_ascend.sample.sampler import (
 )
 from vllm_ascend.utils import global_stream, npu_stream_switch
 
-_CPU_GENERATOR_CACHE_310P: dict[int, tuple[torch.Generator, int]] = {}
+_CPU_GENERATOR_CACHE_310P: dict[int, tuple[torch.Generator, int, int]] = {}
 
 
 def _get_cpu_generator_310p(i: int, generator: torch.Generator) -> torch.Generator:
+    seed = generator.initial_seed()
     cache_entry = _CPU_GENERATOR_CACHE_310P.get(i)
-    if cache_entry is None or cache_entry[1] != id(generator):
+    if cache_entry is None or cache_entry[1] != id(generator) or cache_entry[2] != seed:
         cpu_generator = torch.Generator(device="cpu")
-        try:
-            # Keep RNG stream consistent with the original generator.
-            cpu_generator.set_state(generator.get_state())
-        except Exception:
-            cpu_generator.manual_seed(generator.initial_seed())
-        cache_entry = (cpu_generator, id(generator))
+        # 310P CPU fallback must not read state from an NPU generator: that can
+        # block in seeded sampling paths. The cached CPU generator advances
+        # independently after being initialized from the same request seed.
+        cpu_generator.manual_seed(seed)
+        cache_entry = (cpu_generator, id(generator), seed)
         _CPU_GENERATOR_CACHE_310P[i] = cache_entry
     return cache_entry[0]
 
@@ -49,16 +49,21 @@ def _fill_cpu_exponential_310p(
     has_draft_mask: torch.Tensor | None = None,
 ) -> None:
     """Fill a CPU tensor with exponential values for 310P stability."""
-    if len(generators) != q_cpu.shape[0]:
+    if has_draft_mask is not None and has_draft_mask.device.type != "cpu":
+        has_draft_mask = has_draft_mask.cpu()
+    all_rows_seeded = len(generators) == q_cpu.shape[0] and set(generators) == set(
+        range(q_cpu.shape[0])
+    )
+    if not all_rows_seeded:
         q_cpu.exponential_()
     if not generators:
         return
     for i, generator in generators.items():
         cpu_gen = _get_cpu_generator_310p(i, generator)
         if has_draft_mask is not None:
-            temp_q = torch.empty_like(q_cpu[i])
-            temp_q.exponential_(generator=cpu_gen)
-            q_cpu[i] = torch.where(has_draft_mask[i], temp_q, q_cpu[i])
+            if not bool(has_draft_mask[i]):
+                continue
+            q_cpu[i].exponential_(generator=cpu_gen)
         else:
             q_cpu[i].exponential_(generator=cpu_gen)
 
@@ -89,6 +94,31 @@ def _random_sample_310p(
     return probs.div_(q).argmax(dim=-1).view(-1)
 
 
+def generate_uniform_probs_310p(
+    num_tokens: int,
+    num_draft_tokens: list[int],
+    generators: dict[int, torch.Generator],
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate flattened uniform samples on CPU for 310P seeded rejection."""
+    uniform_cpu = torch.empty(num_tokens, dtype=torch.float32, device="cpu", pin_memory=True)
+    all_rows_seeded = len(generators) == len(num_draft_tokens) and set(generators) == set(
+        range(len(num_draft_tokens))
+    )
+    if not all_rows_seeded:
+        uniform_cpu.uniform_()
+
+    start = 0
+    for i, num_draft in enumerate(num_draft_tokens):
+        end = start + num_draft
+        if num_draft > 0 and i in generators:
+            cpu_gen = _get_cpu_generator_310p(i, generators[i])
+            uniform_cpu[start:end].uniform_(generator=cpu_gen)
+        start = end
+
+    return uniform_cpu.to(device, non_blocking=True)
+
+
 class AscendTopKTopPSampler310(AscendTopKTopPSampler):
     def forward_native(self, logits, generators, k, p):
         if envs.VLLM_BATCH_INVARIANT:
@@ -101,7 +131,7 @@ class AscendTopKTopPSampler310(AscendTopKTopPSampler):
             elif self.logprobs_mode == "processed_logprobs":
                 logits_to_return = cand_logits.log_softmax(dim=-1, dtype=torch.float32)
 
-            probs = torch.softmax(cand_logits, dim=-1)
+            probs = cand_logits.softmax(dim=-1, dtype=torch.float32)
             pos = _random_sample_310p(probs, generators)  # [B]
 
             next_token = cand_idx.gather(dim=1, index=pos.unsqueeze(1)).squeeze(1)  # [B]
